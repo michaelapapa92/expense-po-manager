@@ -1,5 +1,6 @@
 import { storage } from "./storage";
 import type { Expense, PurchaseOrder } from "@shared/schema";
+import { getAppUrl } from "./app-url";
 
 const QBO_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2";
 const QBO_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
@@ -16,8 +17,7 @@ function getClientSecret(): string {
 }
 
 function getRedirectUri(): string {
-  const base = process.env.APP_URL || "https://expense-flow-papa92.replit.app";
-  return `${base}/api/quickbooks/callback`;
+  return `${getAppUrl()}/api/quickbooks/callback`;
 }
 
 function isSandbox(): boolean {
@@ -494,8 +494,13 @@ export async function syncPendingBills(): Promise<{
       const status = await checkBillPaymentStatus(bill.qboBillId);
 
       if (status === "paid") {
-        const expense = await storage.getExpense(bill.expenseId);
-        if (expense && expense.status !== "Reimbursed") {
+        // This table holds both expense-derived and PO-derived bills, so
+        // expenseId is nullable. A PO bill has no expense to reimburse -- and a
+        // purchase order has no status past "Order Placed" -- so only the bill
+        // row is updated for those. Previously this called getExpense(null),
+        // which quietly matched nothing.
+        const expense = bill.expenseId ? await storage.getExpense(bill.expenseId) : undefined;
+        if (bill.expenseId && expense && expense.status !== "Reimbursed") {
           await storage.updateExpenseStatus(bill.expenseId, "Reimbursed");
 
           await storage.createExpenseHistory({

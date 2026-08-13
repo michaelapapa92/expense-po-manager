@@ -1,9 +1,7 @@
+import { getAppUrl } from "./app-url";
+
 const WEBEX_BOT_TOKEN = process.env.WEBEX_BOT_TOKEN;
 const WEBEX_API_BASE = "https://webexapis.com/v1";
-
-function getAppUrl(): string {
-  return process.env.APP_URL || `https://${process.env.REPLIT_DEV_DOMAIN || process.env.REPLIT_DOMAINS || "localhost:5000"}`;
-}
 
 function buildExpenseLink(expenseId?: string): string {
   if (!expenseId) return "";
