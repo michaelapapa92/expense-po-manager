@@ -65,7 +65,9 @@ app.use((req, res, next) => {
 
 (async () => {
   await seed();
-  await setupAuth(app);
+  if (process.env.BYPASS_AUTH !== "true") {
+    await setupAuth(app);
+  }
   registerAuthRoutes(app);
   await registerRoutes(httpServer, app);
 
@@ -90,14 +92,14 @@ app.use((req, res, next) => {
   }
 
   const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
+  const listenOptions: { port: number; host: string; reusePort?: boolean } = {
+    port,
+    host: "0.0.0.0",
+  };
+  if (process.platform === "linux") {
+    listenOptions.reusePort = true;
+  }
+  httpServer.listen(listenOptions, () => {
+    log(`serving on port ${port}`);
+  });
 })();

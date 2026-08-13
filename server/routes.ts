@@ -4,7 +4,7 @@ import { storage } from "./storage";
 import { authStorage } from "./replit_integrations/auth";
 import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
 import { z } from "zod";
-import OpenAI from "openai";
+import { scanReceiptImage } from "./receipt-ocr";
 import { sendEmail, buildExpenseSubmittedEmail, buildStatusChangeEmail, buildCommentEmail, buildApprovalNeededEmail } from "./email";
 import { sendWebexDirectMessage, buildWebexExpenseSubmitted, buildWebexStatusChange, buildWebexComment, buildWebexApprovalNeeded } from "./webex";
 import {
@@ -517,9 +517,9 @@ export async function registerRoutes(
 
     if (updated) {
       const newStatus = parsed.data as ExpenseStatus;
+      const appUser = await getAppUser(req);
 
       try {
-        const appUser = await getAppUser(req);
         const changerName = appUser?.name || "System";
         await storage.createExpenseHistory({
           expenseId: expense.id,
@@ -981,67 +981,15 @@ export async function registerRoutes(
       const { image } = req.body;
       if (!image) return res.status(400).json({ message: "Image data is required" });
 
-      if (!process.env.AI_INTEGRATIONS_OPENAI_API_KEY || !process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) {
-        console.error("Receipt scan error: AI integration env vars not configured");
-        return res.status(500).json({ message: "AI scanning is not configured. Please fill in the details manually." });
-      }
-
-      console.log(`[scan-receipt] Starting scan, image data length: ${image.length} chars`);
+      console.log(`[scan-receipt] Starting OCR scan, image data length: ${image.length} chars`);
 
       const activeCategories = await storage.getActiveCategories();
       const categoryNames = activeCategories.map(c => c.name);
-      const categoryList = categoryNames.length > 0 ? categoryNames.join(", ") : "Flights, Meals, Hotel, Mileage, Taxi";
-      const defaultCategory = categoryNames[0] || "Meals";
 
-      const openai = new OpenAI({
-        apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-        baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-      });
+      const result = await scanReceiptImage(image, categoryNames);
+      console.log(`[scan-receipt] OCR result: ${JSON.stringify(result)}`);
 
-      const response = await openai.chat.completions.create({
-        model: "gpt-4.1",
-        messages: [
-          {
-            role: "system",
-            content: `You are a receipt scanning assistant. Extract the following information from the receipt image:
-- total: The total amount (number only, no currency symbol)
-- date: The date on the receipt in YYYY-MM-DD format
-- business: The business/vendor name
-- category: Best matching category from: ${categoryList}
-
-Respond ONLY with valid JSON in this exact format:
-{"total": "0.00", "date": "2025-01-01", "business": "Business Name", "category": "${defaultCategory}"}
-
-If you cannot determine a field, use null for that field.`
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: image }
-              },
-              {
-                type: "text",
-                text: "Please scan this receipt and extract the total amount, date, business name, and category."
-              }
-            ]
-          }
-        ],
-        max_completion_tokens: 200,
-      });
-
-      const content = response.choices[0]?.message?.content || "{}";
-      console.log(`[scan-receipt] AI response: ${content}`);
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      const parsedResult = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-
-      res.json({
-        total: parsedResult.total || null,
-        date: parsedResult.date || null,
-        business: parsedResult.business || null,
-        category: parsedResult.category || null,
-      });
+      res.json(result);
     } catch (error: any) {
       console.error("Receipt scan error:", error?.message || error);
       res.status(500).json({ message: "Failed to scan receipt. Please fill in the details manually." });
