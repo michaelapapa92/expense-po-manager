@@ -3,7 +3,7 @@ import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
 import { seed } from "./seed";
-import { setupAuth, registerAuthRoutes } from "./replit_integrations/auth";
+import { setupAuth, registerAuthRoutes } from "./auth";
 
 const app = express();
 const httpServer = createServer(app);
@@ -24,6 +24,14 @@ app.use(
 );
 
 app.use(express.urlencoded({ extended: false }));
+
+// Express 5 leaves req.body undefined when no parser matched the request (no
+// body, or a Content-Type the parsers ignore). Handlers destructure it directly,
+// which threw a TypeError and surfaced as a 500 instead of a validation error.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
@@ -65,19 +73,27 @@ app.use((req, res, next) => {
 
 (async () => {
   await seed();
-  await setupAuth(app);
+  if (process.env.BYPASS_AUTH !== "true") {
+    await setupAuth(app);
+  }
   registerAuthRoutes(app);
   await registerRoutes(httpServer, app);
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
 
     console.error("Internal Server Error:", err);
 
     if (res.headersSent) {
       return next(err);
     }
+
+    // Deliberate 4xx carry a message written for the caller. Anything else is
+    // unexpected -- echoing err.message there leaked raw Postgres text such as
+    // table and constraint names to the client.
+    const message = status < 500
+      ? (err.message || "Request failed")
+      : "Internal Server Error";
 
     return res.status(status).json({ message });
   });
@@ -90,14 +106,14 @@ app.use((req, res, next) => {
   }
 
   const port = parseInt(process.env.PORT || "5000", 10);
-  httpServer.listen(
-    {
-      port,
-      host: "0.0.0.0",
-      reusePort: true,
-    },
-    () => {
-      log(`serving on port ${port}`);
-    },
-  );
+  const listenOptions: { port: number; host: string; reusePort?: boolean } = {
+    port,
+    host: "0.0.0.0",
+  };
+  if (process.platform === "linux") {
+    listenOptions.reusePort = true;
+  }
+  httpServer.listen(listenOptions, () => {
+    log(`serving on port ${port}`);
+  });
 })();

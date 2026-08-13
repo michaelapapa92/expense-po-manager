@@ -1,6 +1,6 @@
 import type { Express } from "express";
 import { authStorage } from "./storage";
-import { isAuthenticated } from "./replitAuth";
+import { isAuthenticated } from "./oidc";
 
 export function registerAuthRoutes(app: Express): void {
   app.get("/api/auth/user", async (req: any, res) => {

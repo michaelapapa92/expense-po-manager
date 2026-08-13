@@ -76,6 +76,7 @@ export interface IStorage {
 
   getAttachmentsByExpense(expenseId: string): Promise<ExpenseAttachment[]>;
   createAttachment(attachment: InsertExpenseAttachment): Promise<ExpenseAttachment>;
+  getAttachment(id: string): Promise<ExpenseAttachment | undefined>;
   deleteAttachment(id: string): Promise<boolean>;
 
   bulkUpdateExpenseStatus(ids: string[], status: string): Promise<Expense[]>;
@@ -349,6 +350,11 @@ export class DatabaseStorage implements IStorage {
     return created;
   }
 
+  async getAttachment(id: string): Promise<ExpenseAttachment | undefined> {
+    const [found] = await db.select().from(expenseAttachments).where(eq(expenseAttachments.id, id));
+    return found;
+  }
+
   async deleteAttachment(id: string): Promise<boolean> {
     const result = await db.delete(expenseAttachments).where(eq(expenseAttachments.id, id)).returning();
     return result.length > 0;
@@ -515,10 +521,14 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  // Derived from the highest number actually issued, not from row count: a
+  // deleted PO or a manually-typed number would otherwise make count+1 hand
+  // back a number that already exists, and po_number is UNIQUE.
   async getNextPoNumber(): Promise<string> {
-    const result = await db.select({ count: sql<number>`count(*)` }).from(purchaseOrders);
-    const count = Number(result[0]?.count || 0);
-    const nextNum = count + 1;
+    const result = await db
+      .select({ max: sql<number>`coalesce(max(nullif(regexp_replace(${purchaseOrders.poNumber}, '\\D', '', 'g'), '')::bigint), 0)` })
+      .from(purchaseOrders);
+    const nextNum = Number(result[0]?.max || 0) + 1;
     return `PO-${String(nextNum).padStart(5, '0')}`;
   }
 

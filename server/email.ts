@@ -1,6 +1,7 @@
 import { ClientSecretCredential } from "@azure/identity";
 import { Client } from "@microsoft/microsoft-graph-client";
 import { TokenCredentialAuthenticationProvider } from "@microsoft/microsoft-graph-client/authProviders/azureTokenCredentials/index.js";
+import { getAppUrl } from "./app-url";
 
 const TENANT_ID = process.env.MS_TENANT_ID;
 const CLIENT_ID = process.env.MS_CLIENT_ID;
@@ -59,10 +60,6 @@ export async function sendEmail(options: EmailOptions): Promise<boolean> {
     console.error(`[email] Failed to send to ${options.to}:`, error?.message || error);
     return false;
   }
-}
-
-function getAppUrl(): string {
-  return process.env.APP_URL || `https://${process.env.REPLIT_DEV_DOMAIN || process.env.REPLIT_DOMAINS || "localhost:5000"}`;
 }
 
 function buildViewButton(expenseId?: string): string {

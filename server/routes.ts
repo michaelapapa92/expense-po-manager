@@ -1,10 +1,10 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { authStorage } from "./replit_integrations/auth";
-import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
+import { authStorage } from "./auth";
+import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, type POStatus, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
 import { z } from "zod";
-import OpenAI from "openai";
+import { scanReceiptImage } from "./receipt-ocr";
 import { sendEmail, buildExpenseSubmittedEmail, buildStatusChangeEmail, buildCommentEmail, buildApprovalNeededEmail } from "./email";
 import { sendWebexDirectMessage, buildWebexExpenseSubmitted, buildWebexStatusChange, buildWebexComment, buildWebexApprovalNeeded } from "./webex";
 import {
@@ -47,15 +47,239 @@ function getAllSubordinateIds(userId: string, allUsers: any[]): string[] {
     }
   }
   const subordinates: string[] = [];
+  // `seen` also guards against reporting cycles (A manages B, B manages A).
+  // Without it this loop never terminates, and because it is synchronous it
+  // blocks the event loop and takes the whole process down, not just one request.
+  const seen = new Set<string>([userId]);
   const queue = [...(childrenMap.get(userId) || [])];
   let i = 0;
   while (i < queue.length) {
     const current = queue[i++];
+    if (seen.has(current)) continue;
+    seen.add(current);
     subordinates.push(current);
     const children = childrenMap.get(current);
     if (children) queue.push(...children);
   }
   return subordinates;
+}
+
+/**
+ * Aseva's approval chain: every workflow ends at the General Manager, except a
+ * report submitted by the GM, which ends at the Executive Chairman.
+ *
+ * The submitter's own manager reviews first, unless that manager is already the
+ * final approver -- a direct report of the GM needs one approval, not two.
+ */
+export function expenseApprovalPlan(submitter: any, allUsers: any[]) {
+  const finalRole = submitter.role === "General Manager" ? "Executive Chairman" : "General Manager";
+  const finalApprover = allUsers.find(u => u.role === finalRole) || null;
+  const finalStatus: ExpenseStatus = finalRole === "Executive Chairman" ? "EC Approved" : "GM Approved";
+  const finalRejected: ExpenseStatus = finalRole === "Executive Chairman" ? "EC Rejected" : "GM Rejected";
+
+  const directManager = submitter.managerId
+    ? allUsers.find(u => u.id === submitter.managerId) || null
+    : null;
+  const needsManagerStage = !!directManager && (!finalApprover || directManager.id !== finalApprover.id);
+
+  return { finalApprover, finalStatus, finalRejected, directManager, needsManagerStage };
+}
+
+/**
+ * Decides whether `actor` may move `expense` to `newStatus`.
+ * Admins may act out of turn to unstick things, but nobody -- admin included --
+ * may approve their own report.
+ */
+export function canTransitionExpense(
+  actor: any,
+  expense: any,
+  newStatus: ExpenseStatus,
+  plan: ReturnType<typeof expenseApprovalPlan>,
+): { ok: true } | { ok: false; status: number; message: string } {
+  const deny = (message: string, status = 403) => ({ ok: false as const, status, message });
+  const isSubmitter = actor.id === expense.employeeId;
+  const current = expense.status as ExpenseStatus;
+
+  // Submitter-only transitions.
+  if (newStatus === "Cancelled") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can cancel their own expense");
+    return { ok: true };
+  }
+  if (newStatus === "Draft" || newStatus === "Submitted") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can submit their own expense");
+    return { ok: true };
+  }
+
+  // Everything below is an approval decision.
+  if (isSubmitter) return deny("You cannot approve or reject your own expense");
+
+  const isManagerStage = newStatus === "Manager Approved" || newStatus === "Manager Rejected";
+  const isFinalStage = newStatus === plan.finalStatus || newStatus === plan.finalRejected;
+
+  if (isManagerStage) {
+    if (!plan.needsManagerStage) {
+      return deny("This expense does not need a separate manager review");
+    }
+    if (current !== "Submitted") return deny(`Cannot move an expense from ${current} to ${newStatus}`, 409);
+    if (!actor.isAdmin && actor.id !== plan.directManager?.id) {
+      return deny("Only the submitter's manager can review this expense");
+    }
+    return { ok: true };
+  }
+
+  if (isFinalStage) {
+    // "Manager Approved" is always a valid predecessor, even when this expense
+    // would not have required a manager stage today -- rows predating a change
+    // of manager (or of these rules) sit there and must stay approvable.
+    // Requiring it when a manager stage IS needed is what stops stage-skipping.
+    const allowedFrom = plan.needsManagerStage
+      ? ["Manager Approved"]
+      : ["Submitted", "Manager Approved"];
+    if (!allowedFrom.includes(current)) {
+      return deny(`Cannot move an expense from ${current} to ${newStatus}`, 409);
+    }
+    if (!actor.isAdmin && actor.id !== plan.finalApprover?.id) {
+      return deny(`Only the ${plan.finalApprover?.role ?? "final approver"} can approve this expense`);
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "Reimbursed") {
+    if (!actor.isAdmin && !actor.isAccountsPayable) {
+      return deny("Only Accounts Payable or an admin can mark an expense reimbursed");
+    }
+    return { ok: true };
+  }
+
+  // The AP stage is retired but the statuses survive on historical rows.
+  if (newStatus === "Accounts Payable" || newStatus === "AP Rejected") {
+    if (!actor.isAdmin) return deny(`${newStatus} is no longer part of the approval flow`);
+    return { ok: true };
+  }
+
+  // What is left is an approval status from the branch this expense does not
+  // take -- e.g. EC Approved on an employee's report, which ends at the GM.
+  // Admins may act out of turn, but not invent a stage this expense never has.
+  return deny(`${newStatus} is not a valid step for this expense`);
+}
+
+/**
+ * Purchase orders always end at the General Manager -- they never go to the
+ * Executive Chairman. After GM approval the PO Admin places the order.
+ */
+export function poApprovalPlan(submitter: any, allUsers: any[]) {
+  const gm = allUsers.find(u => u.role === "General Manager") || null;
+  const poAdmin = allUsers.find(u => u.isPOAdmin) || null;
+  const directManager = submitter.managerId
+    ? allUsers.find(u => u.id === submitter.managerId) || null
+    : null;
+  const needsManagerStage = !!directManager && (!gm || directManager.id !== gm.id);
+  return { gm, poAdmin, directManager, needsManagerStage };
+}
+
+export function canTransitionPo(
+  actor: any,
+  po: any,
+  newStatus: POStatus,
+  plan: ReturnType<typeof poApprovalPlan>,
+): { ok: true } | { ok: false; status: number; message: string } {
+  const deny = (message: string, status = 403) => ({ ok: false as const, status, message });
+  const isSubmitter = actor.id === po.submitterId;
+  const current = po.status as POStatus;
+
+  if (newStatus === "Cancelled") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can cancel their own PO");
+    return { ok: true };
+  }
+  if (newStatus === "Draft" || newStatus === "Submitted") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can submit their own PO");
+    return { ok: true };
+  }
+
+  // Purchase orders stop at the GM.
+  if (newStatus === "EC Approved" || newStatus === "EC Rejected") {
+    return deny("Purchase orders are not approved by the Executive Chairman");
+  }
+
+  if (isSubmitter) return deny("You cannot review your own purchase order");
+
+  const isPoAdminActor = actor.isPOAdmin || actor.isAdmin;
+
+  if (newStatus === "PO Admin Review" || newStatus === "More Info Requested") {
+    if (!isPoAdminActor && actor.id !== plan.directManager?.id && actor.id !== plan.gm?.id) {
+      return deny("Only the PO Administrator or an approver can review this PO");
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "PO Admin Rejected") {
+    return deny("PO Administrators cannot reject purchase orders. Use 'Request More Info' instead.");
+  }
+
+  if (newStatus === "Manager Approved" || newStatus === "Manager Rejected") {
+    if (!plan.needsManagerStage) return deny("This PO does not need a separate manager review");
+    if (!actor.isAdmin && actor.id !== plan.directManager?.id) {
+      return deny("Only the submitter's manager can review this PO");
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "GM Approved" || newStatus === "GM Rejected") {
+    if (!actor.isAdmin && actor.id !== plan.gm?.id) {
+      return deny("Only the General Manager can give final approval on a PO");
+    }
+    // Approving out of order would skip the manager entirely; rejecting is
+    // always allowed, since stopping a PO early is never harmful.
+    if (newStatus === "GM Approved" && plan.needsManagerStage && current !== "Manager Approved") {
+      return deny(`Cannot move a PO from ${current} to GM Approved before manager review`, 409);
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "Ordering" || newStatus === "Order Placed") {
+    if (!isPoAdminActor) return deny("Only the PO Administrator can place the order");
+    if (current !== "GM Approved" && current !== "Ordering") {
+      return deny(`Cannot place an order for a PO at ${current}; it needs GM approval first`, 409);
+    }
+    return { ok: true };
+  }
+
+  return deny(`${newStatus} is not a valid step for this purchase order`);
+}
+
+/** Yours, one of your reports', or you are an admin. */
+async function canViewExpense(appUser: any, expense: any): Promise<boolean> {
+  if (appUser.isAdmin) return true;
+  if (expense.employeeId === appUser.id) return true;
+  const allUsers = await storage.getUsers();
+  return getAllSubordinateIds(appUser.id, allUsers).includes(expense.employeeId);
+}
+
+/**
+ * `viewAsUserId` is an admin impersonation aid. The expense routes always
+ * gated it on isAdmin; the notification routes did not, so any signed-in
+ * employee could read -- and mark read -- a colleague's notifications.
+ */
+function resolveNotificationTarget(req: any, appUser: any): string {
+  const requested = req.query.viewAsUserId as string | undefined;
+  if (requested && appUser.isAdmin) return requested;
+  return appUser.id;
+}
+
+/** Walks up the reporting line from `user`. Cycle-safe: a loop in the manager
+ *  graph would otherwise spin forever, re-querying the same rows. */
+async function buildManagerChain(user: any): Promise<any[]> {
+  const chain: any[] = [];
+  const seen = new Set<string>([user.id]);
+  let current = user;
+  while (current?.managerId && !seen.has(current.managerId)) {
+    seen.add(current.managerId);
+    const mgr = await storage.getUser(current.managerId);
+    if (!mgr) break;
+    chain.push(mgr);
+    current = mgr;
+  }
+  return chain;
 }
 
 async function requireAuth(req: any, res: any, next: any) {
@@ -86,6 +310,13 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // Everything below is authenticated by default. Auth was previously opt-in
+  // per route and most routes simply never opted in, leaving expense approval,
+  // PO editing and the employee directory reachable with no session at all.
+  // The OIDC routes (/api/login, /api/callback, /api/logout) and /api/auth/user
+  // are registered in index.ts *before* this call, so they stay public.
+  app.use("/api", requireAuth);
 
   app.get("/api/users", requireAuth, async (_req, res) => {
     const users = await storage.getUsers();
@@ -190,6 +421,19 @@ export async function registerRoutes(
     if (managerId !== null && typeof managerId !== "string") {
       return res.status(400).json({ message: "managerId must be a string or null" });
     }
+    // A cycle in the reporting graph makes the org-chart walks spin forever,
+    // so reject it here rather than letting it get written.
+    if (managerId !== null) {
+      if (managerId === req.params.id) {
+        return res.status(400).json({ message: "A user cannot be their own manager" });
+      }
+      const proposedManager = await storage.getUser(managerId);
+      if (!proposedManager) return res.status(404).json({ message: "Manager not found" });
+      const chain = await buildManagerChain(proposedManager);
+      if (proposedManager.id === req.params.id || chain.some(m => m.id === req.params.id)) {
+        return res.status(400).json({ message: "That change would create a reporting cycle" });
+      }
+    }
     const user = await storage.updateUserManager(req.params.id, managerId);
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(sanitizeUser(user));
@@ -207,13 +451,20 @@ export async function registerRoutes(
 
   app.patch("/api/users/:id/profile", requireSelfOrAdmin, async (req, res) => {
     const { name, email } = req.body;
-    if (!name || typeof name !== "string") return res.status(400).json({ message: "name is required" });
-    if (!email || typeof email !== "string") return res.status(400).json({ message: "email is required" });
-    const nameParts = name.trim().split(/\s+/);
+    if (typeof name !== "string" || typeof email !== "string") {
+      return res.status(400).json({ message: "name and email are required" });
+    }
+    // Trim before the emptiness check: "   " is truthy, and letting it through
+    // blanked the user's name and initials outright.
+    const trimmedName = name.trim();
+    const trimmedEmail = email.trim();
+    if (!trimmedName) return res.status(400).json({ message: "name is required" });
+    if (!trimmedEmail) return res.status(400).json({ message: "email is required" });
+    const nameParts = trimmedName.split(/\s+/);
     const avatarInitials = nameParts.length >= 2
       ? (nameParts[0][0] + nameParts[nameParts.length - 1][0]).toUpperCase()
-      : name.slice(0, 2).toUpperCase();
-    const user = await storage.updateUserProfile(req.params.id, { name: name.trim(), email: email.trim(), avatarInitials });
+      : trimmedName.slice(0, 2).toUpperCase();
+    const user = await storage.updateUserProfile(req.params.id, { name: trimmedName, email: trimmedEmail, avatarInitials });
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(sanitizeUser(user));
   });
@@ -434,6 +685,12 @@ export async function registerRoutes(
   app.post("/api/expenses", async (req, res) => {
     const parsed = insertExpenseSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+
+    // Without this an unknown id trips the employee_id foreign key, which the
+    // error handler reported as a 500 rather than a bad request.
+    const employee = await storage.getUser(parsed.data.employeeId);
+    if (!employee) return res.status(400).json({ message: "Unknown employeeId" });
+
     const expense = await storage.createExpense(parsed.data);
 
     try {
@@ -496,30 +753,38 @@ export async function registerRoutes(
   });
 
   app.patch("/api/expenses/:id/status", async (req, res) => {
-    const { status, userId } = req.body;
+    const { status } = req.body;
     const parsed = statusEnum.safeParse(status);
     if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
 
     const expense = await storage.getExpense(req.params.id);
     if (!expense) return res.status(404).json({ message: "Expense not found" });
 
-    if (status === "Cancelled") {
-      if (!userId || expense.employeeId !== userId) {
-        return res.status(403).json({ message: "Only the submitter can cancel their own expense" });
-      }
-      if (expense.status === "Reimbursed" || expense.status === "Cancelled") {
-        return res.status(400).json({ message: "Cannot cancel an expense that is already reimbursed or cancelled" });
-      }
+    // Identity comes from the session, never from the request body -- the old
+    // `userId` field let a caller nominate whoever they liked.
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    const newStatus = parsed.data as ExpenseStatus;
+
+    if (newStatus === "Cancelled" &&
+        (expense.status === "Reimbursed" || expense.status === "Cancelled")) {
+      return res.status(400).json({ message: "Cannot cancel an expense that is already reimbursed or cancelled" });
     }
+
+    const allUsers = await storage.getUsers();
+    const submitter = allUsers.find(u => u.id === expense.employeeId);
+    if (!submitter) return res.status(404).json({ message: "Submitter not found" });
+    const plan = expenseApprovalPlan(submitter, allUsers);
+
+    const verdict = canTransitionExpense(appUser, expense, newStatus, plan);
+    if (!verdict.ok) return res.status(verdict.status).json({ message: verdict.message });
 
     const oldStatus = expense.status;
     const updated = await storage.updateExpenseStatus(req.params.id, parsed.data);
 
     if (updated) {
-      const newStatus = parsed.data as ExpenseStatus;
-
       try {
-        const appUser = await getAppUser(req);
         const changerName = appUser?.name || "System";
         await storage.createExpenseHistory({
           expenseId: expense.id,
@@ -625,61 +890,47 @@ export async function registerRoutes(
         createBillForExpense(expense).catch(e => console.error("[quickbooks] Bill creation error:", e));
       }
 
-      if (newStatus === "Manager Approved" || newStatus === "GM Approved" || newStatus === "EC Approved") {
+      // Only the manager stage has someone after it. `plan.finalStatus` is the
+      // end of the line -- the expense goes to QuickBooks from there, not on to
+      // another approver.
+      if (newStatus === "Manager Approved") {
         try {
-          const submitter = await storage.getUser(expense.employeeId);
-          if (submitter?.managerId) {
-            const managerChain: any[] = [];
-            let currentUser = submitter;
-            while (currentUser?.managerId) {
-              const mgr = await storage.getUser(currentUser.managerId);
-              if (mgr) managerChain.push(mgr);
-              currentUser = mgr as any;
-            }
+          const nextApprover = plan.finalApprover;
+          const stage = `${plan.finalApprover?.role ?? "Final"} Review`;
 
-            let nextApprover = null;
-            if (newStatus === "Manager Approved") {
-              nextApprover = managerChain.find(m => m.role === "General Manager" || m.role === "Executive Chairman");
-            } else if (newStatus === "GM Approved") {
-              nextApprover = managerChain.find(m => m.role === "Executive Chairman");
-            }
+          if (nextApprover && nextApprover.id !== appUser?.id) {
+            await storage.createNotification({
+              userId: nextApprover.id,
+              type: "approval_needed",
+              title: "Expense Awaiting Your Approval",
+              message: `${expense.employeeName}'s expense "${expense.description}" ($${expense.amount}) needs your review (${stage})`,
+              expenseId: expense.id,
+              isRead: false,
+            });
+          }
 
-            const stage = newStatus === "Manager Approved" ? "GM Review" : "Executive Chairman Review";
-
-            if (nextApprover && nextApprover.id !== appUser?.id) {
-              await storage.createNotification({
-                userId: nextApprover.id,
-                type: "approval_needed",
-                title: "Expense Awaiting Your Approval",
-                message: `${expense.employeeName}'s expense "${expense.description}" ($${expense.amount}) needs your review (${stage})`,
-                expenseId: expense.id,
-                isRead: false,
-              });
-            }
-
-            if (nextApprover?.notifyEmail && nextApprover.email) {
-              const emailData = buildApprovalNeededEmail({
-                approverName: nextApprover.name,
-                employeeName: expense.employeeName,
-                description: expense.description,
-                amount: expense.amount,
-                stage,
-                expenseId: expense.id,
-              });
-              sendEmail({ to: nextApprover.email, ...emailData }).catch(e => console.error("[email] Error:", e));
-            }
-            if (nextApprover?.notifyWebex && nextApprover?.email) {
-              const webexMsg = buildWebexApprovalNeeded({
-                approverName: nextApprover.name,
-                employeeName: expense.employeeName,
-                description: expense.description,
-                amount: expense.amount,
-                stage,
-                notes: expense.notes,
-                expenseId: expense.id,
-              });
-              sendWebexDirectMessage(nextApprover.email, webexMsg).catch(e => console.error("[webex] Error:", e));
-            }
+          if (nextApprover?.notifyEmail && nextApprover.email) {
+            const emailData = buildApprovalNeededEmail({
+              approverName: nextApprover.name,
+              employeeName: expense.employeeName,
+              description: expense.description,
+              amount: expense.amount,
+              stage,
+              expenseId: expense.id,
+            });
+            sendEmail({ to: nextApprover.email, ...emailData }).catch(e => console.error("[email] Error:", e));
+          }
+          if (nextApprover?.notifyWebex && nextApprover?.email) {
+            const webexMsg = buildWebexApprovalNeeded({
+              approverName: nextApprover.name,
+              employeeName: expense.employeeName,
+              description: expense.description,
+              amount: expense.amount,
+              stage,
+              notes: expense.notes,
+              expenseId: expense.id,
+            });
+            sendWebexDirectMessage(nextApprover.email, webexMsg).catch(e => console.error("[webex] Error:", e));
           }
         } catch (e) {
           console.error("Failed to send next-approver notification email:", e);
@@ -702,18 +953,21 @@ export async function registerRoutes(
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
 
     const allUsers = await storage.getUsers();
-    const subordinateIds = getAllSubordinateIds(appUser.id, allUsers);
-    const isManager = appUser.role === "Manager" || appUser.role === "General Manager" || appUser.role === "Executive Chairman";
-    const isAdmin = appUser.isAdmin;
 
     const oldExpenses = await Promise.all(expenseIds.map((id: string) => storage.getExpense(id)));
     const validExpenses = oldExpenses.filter(e => e != null);
 
+    // Same rules as the single-expense endpoint, so approving in bulk cannot be
+    // used to skip a stage or self-approve.
     for (const expense of validExpenses) {
-      const isSubordinate = subordinateIds.includes(expense.employeeId);
-      const canApprove = isAdmin || (isManager && isSubordinate);
-      if (!canApprove) {
-        return res.status(403).json({ message: `Not authorized to update expense "${expense.description}"` });
+      const submitter = allUsers.find(u => u.id === expense.employeeId);
+      if (!submitter) {
+        return res.status(404).json({ message: `Submitter not found for "${expense.description}"` });
+      }
+      const plan = expenseApprovalPlan(submitter, allUsers);
+      const verdict = canTransitionExpense(appUser, expense, parsed.data as ExpenseStatus, plan);
+      if (!verdict.ok) {
+        return res.status(verdict.status).json({ message: `"${expense.description}": ${verdict.message}` });
       }
     }
 
@@ -796,45 +1050,48 @@ export async function registerRoutes(
     const body = { ...req.body, expenseId: req.params.id };
     const parsed = insertCommentSchema.safeParse(body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+
+    // Check the parent first: inserting against a missing expense trips the
+    // foreign key and surfaces the raw constraint name in a 500.
+    const expense = await storage.getExpense(req.params.id);
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+
     const comment = await storage.createComment(parsed.data);
 
     try {
-      const expense = await storage.getExpense(req.params.id);
-      if (expense) {
-        const commentAuthor = parsed.data.author;
-        const appUser = await getAppUser(req);
-        if (appUser && expense.employeeId !== appUser.id) {
-          await storage.createNotification({
-            userId: expense.employeeId,
-            type: "comment",
-            title: "New Comment on Your Expense",
-            message: `${commentAuthor} commented on "${expense.description}": "${parsed.data.text.substring(0, 100)}${parsed.data.text.length > 100 ? '...' : ''}"`,
-            expenseId: expense.id,
-            isRead: false,
-          });
+      const commentAuthor = parsed.data.author;
+      const appUser = await getAppUser(req);
+      if (appUser && expense.employeeId !== appUser.id) {
+        await storage.createNotification({
+          userId: expense.employeeId,
+          type: "comment",
+          title: "New Comment on Your Expense",
+          message: `${commentAuthor} commented on "${expense.description}": "${parsed.data.text.substring(0, 100)}${parsed.data.text.length > 100 ? '...' : ''}"`,
+          expenseId: expense.id,
+          isRead: false,
+        });
 
-          const submitter = await storage.getUser(expense.employeeId);
-          if (submitter?.notifyEmail && submitter.email) {
-            const emailData = buildCommentEmail({
-              commentAuthor,
-              description: expense.description,
-              amount: expense.amount,
-              commentText: parsed.data.text,
-              expenseId: expense.id,
-            });
-            sendEmail({ to: submitter.email, ...emailData }).catch(e => console.error("[email] Error:", e));
-          }
-          if (submitter?.notifyWebex && submitter?.email) {
-            const webexMsg = buildWebexComment({
-              commentAuthor,
-              description: expense.description,
-              amount: expense.amount,
-              commentText: parsed.data.text,
-              notes: expense.notes,
-              expenseId: expense.id,
-            });
-            sendWebexDirectMessage(submitter.email, webexMsg).catch(e => console.error("[webex] Error:", e));
-          }
+        const submitter = await storage.getUser(expense.employeeId);
+        if (submitter?.notifyEmail && submitter.email) {
+          const emailData = buildCommentEmail({
+            commentAuthor,
+            description: expense.description,
+            amount: expense.amount,
+            commentText: parsed.data.text,
+            expenseId: expense.id,
+          });
+          sendEmail({ to: submitter.email, ...emailData }).catch(e => console.error("[email] Error:", e));
+        }
+        if (submitter?.notifyWebex && submitter?.email) {
+          const webexMsg = buildWebexComment({
+            commentAuthor,
+            description: expense.description,
+            amount: expense.amount,
+            commentText: parsed.data.text,
+            notes: expense.notes,
+            expenseId: expense.id,
+          });
+          sendWebexDirectMessage(submitter.email, webexMsg).catch(e => console.error("[webex] Error:", e));
         }
       }
     } catch (e) {
@@ -845,12 +1102,16 @@ export async function registerRoutes(
   });
 
   app.patch("/api/expenses/:id", async (req, res) => {
-    const { description, amount, date, category, notes, receiptUrl, status, userId, miles } = req.body;
+    const { description, amount, date, category, notes, receiptUrl, miles } = req.body;
 
     const expense = await storage.getExpense(req.params.id);
     if (!expense) return res.status(404).json({ message: "Expense not found" });
 
-    if (userId && expense.employeeId !== userId) {
+    // The ownership check used to read `userId` from the body, so omitting it
+    // skipped the check entirely. Identity comes from the session instead.
+    const editor = await getAppUser(req);
+    if (!editor) return res.status(401).json({ message: "Not authenticated" });
+    if (expense.employeeId !== editor.id && !editor.isAdmin) {
       return res.status(403).json({ message: "Only the submitter can edit their own expense" });
     }
 
@@ -866,10 +1127,13 @@ export async function registerRoutes(
     if (notes !== undefined) updateData.notes = notes;
     if (receiptUrl !== undefined) updateData.receiptUrl = receiptUrl;
     if (miles !== undefined) updateData.miles = miles;
-    if (status !== undefined) {
-      const parsed = statusEnum.safeParse(status);
-      if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
-      updateData.status = parsed.data;
+
+    // Any status the client sends is ignored -- accepting it made this a second,
+    // unguarded way to approve an expense. The reset is decided here instead:
+    // editing an expense that already moved past Draft restarts its approval,
+    // which is the documented behaviour and what the edit form expects.
+    if (expense.status !== "Draft") {
+      updateData.status = "Submitted";
     }
     const oldStatus = expense.status;
     const updated = await storage.updateExpense(req.params.id, updateData);
@@ -918,7 +1182,7 @@ export async function registerRoutes(
   app.get("/api/notifications", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const notifs = await storage.getNotificationsByUser(targetUserId);
     res.json(notifs);
   });
@@ -926,7 +1190,7 @@ export async function registerRoutes(
   app.get("/api/notifications/unread-count", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const count = await storage.getUnreadNotificationCount(targetUserId);
     res.json({ count });
   });
@@ -934,7 +1198,7 @@ export async function registerRoutes(
   app.patch("/api/notifications/:id/read", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const notif = await storage.markNotificationReadForUser(req.params.id, targetUserId);
     if (!notif) return res.status(404).json({ message: "Notification not found" });
     res.json(notif);
@@ -943,12 +1207,23 @@ export async function registerRoutes(
   app.post("/api/notifications/mark-all-read", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     await storage.markAllNotificationsRead(targetUserId);
     res.json({ success: true });
   });
 
   app.get("/api/expenses/:expenseId/attachments", requireAuth, async (req, res) => {
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    // Receipts routinely show home addresses and card fragments, so they follow
+    // the same visibility rule as the expense: yours, your reports', or admin.
+    const expense = await storage.getExpense(req.params.expenseId);
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+    if (!(await canViewExpense(appUser, expense))) {
+      return res.status(403).json({ message: "Not authorized to view these attachments" });
+    }
+
     const attachments = await storage.getAttachmentsByExpense(req.params.expenseId);
     res.json(attachments);
   });
@@ -971,6 +1246,18 @@ export async function registerRoutes(
   });
 
   app.delete("/api/attachments/:id", requireAuth, async (req, res) => {
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    // Deleting a receipt destroys the evidence behind an expense, so this is
+    // the submitter's own call (or an admin's) -- not a reviewer's.
+    const attachment = await storage.getAttachment(req.params.id);
+    if (!attachment) return res.status(404).json({ message: "Attachment not found" });
+    const parent = await storage.getExpense(attachment.expenseId);
+    if (parent && parent.employeeId !== appUser.id && !appUser.isAdmin) {
+      return res.status(403).json({ message: "Not authorized to delete this attachment" });
+    }
+
     const deleted = await storage.deleteAttachment(req.params.id);
     if (!deleted) return res.status(404).json({ message: "Attachment not found" });
     res.json({ message: "Attachment deleted successfully" });
@@ -981,67 +1268,15 @@ export async function registerRoutes(
       const { image } = req.body;
       if (!image) return res.status(400).json({ message: "Image data is required" });
 
-      if (!process.env.AI_INTEGRATIONS_OPENAI_API_KEY || !process.env.AI_INTEGRATIONS_OPENAI_BASE_URL) {
-        console.error("Receipt scan error: AI integration env vars not configured");
-        return res.status(500).json({ message: "AI scanning is not configured. Please fill in the details manually." });
-      }
-
-      console.log(`[scan-receipt] Starting scan, image data length: ${image.length} chars`);
+      console.log(`[scan-receipt] Starting OCR scan, image data length: ${image.length} chars`);
 
       const activeCategories = await storage.getActiveCategories();
       const categoryNames = activeCategories.map(c => c.name);
-      const categoryList = categoryNames.length > 0 ? categoryNames.join(", ") : "Flights, Meals, Hotel, Mileage, Taxi";
-      const defaultCategory = categoryNames[0] || "Meals";
 
-      const openai = new OpenAI({
-        apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-        baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-      });
+      const result = await scanReceiptImage(image, categoryNames);
+      console.log(`[scan-receipt] OCR result: ${JSON.stringify(result)}`);
 
-      const response = await openai.chat.completions.create({
-        model: "gpt-4.1",
-        messages: [
-          {
-            role: "system",
-            content: `You are a receipt scanning assistant. Extract the following information from the receipt image:
-- total: The total amount (number only, no currency symbol)
-- date: The date on the receipt in YYYY-MM-DD format
-- business: The business/vendor name
-- category: Best matching category from: ${categoryList}
-
-Respond ONLY with valid JSON in this exact format:
-{"total": "0.00", "date": "2025-01-01", "business": "Business Name", "category": "${defaultCategory}"}
-
-If you cannot determine a field, use null for that field.`
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "image_url",
-                image_url: { url: image }
-              },
-              {
-                type: "text",
-                text: "Please scan this receipt and extract the total amount, date, business name, and category."
-              }
-            ]
-          }
-        ],
-        max_completion_tokens: 200,
-      });
-
-      const content = response.choices[0]?.message?.content || "{}";
-      console.log(`[scan-receipt] AI response: ${content}`);
-      const jsonMatch = content.match(/\{[\s\S]*\}/);
-      const parsedResult = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
-
-      res.json({
-        total: parsedResult.total || null,
-        date: parsedResult.date || null,
-        business: parsedResult.business || null,
-        category: parsedResult.category || null,
-      });
+      res.json(result);
     } catch (error: any) {
       console.error("Receipt scan error:", error?.message || error);
       res.status(500).json({ message: "Failed to scan receipt. Please fill in the details manually." });
@@ -1342,7 +1577,23 @@ If you cannot determine a field, use null for that field.`
   app.post("/api/purchase-orders", async (req, res) => {
     const parsed = insertPurchaseOrderSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
-    const po = await storage.createPurchaseOrder(parsed.data);
+
+    // The client sends the number it was shown on the form, which may be stale by
+    // the time it submits. Re-derive it here and retry on the unique violation so
+    // two people submitting at once don't collide.
+    let po;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const poNumber = await storage.getNextPoNumber();
+        po = await storage.createPurchaseOrder({ ...parsed.data, poNumber });
+        break;
+      } catch (e: any) {
+        if (e?.code === "23505" && attempt < 5) continue;
+        console.error("Failed to create purchase order:", e);
+        return res.status(e?.code === "23505" ? 409 : 500)
+          .json({ message: "Could not create purchase order. Please try again." });
+      }
+    }
 
     try {
       await storage.createPoHistory({
@@ -1380,56 +1631,75 @@ If you cannot determine a field, use null for that field.`
     res.status(201).json(po);
   });
 
+  // Only these columns may be edited. req.body used to be handed to the update
+  // wholesale, which let a caller rewrite status, submitterId, poNumber or
+  // totalCost -- routing around the approval workflow entirely.
+  const PO_EDITABLE_FIELDS = [
+    "vendor", "usage", "description", "cost", "tax", "shipping", "totalCost",
+    "billingFrequency", "recurringFrequency", "recurringTerm",
+    "projectName", "keyStakeholder", "notes",
+  ] as const;
+
   app.put("/api/purchase-orders/:id", async (req, res) => {
     const po = await storage.getPurchaseOrder(req.params.id);
     if (!po) return res.status(404).json({ message: "Purchase order not found" });
     if (po.status !== "Draft") return res.status(400).json({ message: "Can only edit draft purchase orders" });
-    const updated = await storage.updatePurchaseOrder(req.params.id, req.body);
+
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+    if (appUser.id !== po.submitterId && !appUser.isAdmin) {
+      return res.status(403).json({ message: "Only the submitter can edit their own purchase order" });
+    }
+
+    const updateData: Record<string, any> = {};
+    for (const field of PO_EDITABLE_FIELDS) {
+      if (req.body[field] !== undefined) updateData[field] = req.body[field];
+    }
+
+    const updated = await storage.updatePurchaseOrder(req.params.id, updateData);
     res.json(updated);
   });
 
   app.patch("/api/purchase-orders/:id/status", async (req, res) => {
-    const { status, userId, reason, paymentStatus } = req.body;
+    const { status, reason, paymentStatus } = req.body;
     const parsed = poStatusEnum.safeParse(status);
     if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
 
     const po = await storage.getPurchaseOrder(req.params.id);
     if (!po) return res.status(404).json({ message: "Purchase order not found" });
 
-    const isRejectionOrInfo = status.includes("Rejected") || status === "More Info Requested";
+    const newStatus = parsed.data as POStatus;
+    const isRejectionOrInfo = newStatus.includes("Rejected") || newStatus === "More Info Requested";
     if (isRejectionOrInfo && (!reason || !reason.trim())) {
       return res.status(400).json({ message: "A reason is required when rejecting or requesting more info" });
     }
 
+    // Identity from the session, never from a `userId` in the body.
     const appUser = await getAppUser(req);
-    if (isRejectionOrInfo && appUser) {
-      const isActingPOAdmin = appUser.isPOAdmin && !['Manager', 'General Manager', 'Executive Chairman'].includes(appUser.role);
-      if (isActingPOAdmin && status.includes("Rejected")) {
-        return res.status(403).json({ message: "PO Administrators cannot reject purchase orders. Use 'Request More Info' instead." });
-      }
-    }
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
 
-    if (status === "Order Placed") {
+    if (newStatus === "Order Placed") {
       if (!paymentStatus || !["paid", "accrual"].includes(paymentStatus)) {
         return res.status(400).json({ message: "Payment status ('paid' or 'accrual') is required when marking a PO as ordered" });
       }
     }
 
-    if (status === "Cancelled") {
-      if (!userId || po.submitterId !== userId) {
-        return res.status(403).json({ message: "Only the submitter can cancel their own PO" });
-      }
-      if (po.status === "Order Placed" || po.status === "Cancelled") {
-        return res.status(400).json({ message: "Cannot cancel a placed or cancelled PO" });
-      }
+    if (newStatus === "Cancelled" && (po.status === "Order Placed" || po.status === "Cancelled")) {
+      return res.status(400).json({ message: "Cannot cancel a placed or cancelled PO" });
     }
+
+    const allUsers = await storage.getUsers();
+    const submitter = allUsers.find(u => u.id === po.submitterId);
+    if (!submitter) return res.status(404).json({ message: "Submitter not found" });
+    const poPlan = poApprovalPlan(submitter, allUsers);
+
+    const verdict = canTransitionPo(appUser, po, newStatus, poPlan);
+    if (!verdict.ok) return res.status(verdict.status).json({ message: verdict.message });
 
     const oldStatus = po.status;
     const updated = await storage.updatePurchaseOrderStatus(req.params.id, parsed.data);
 
     if (updated) {
-      const newStatus = parsed.data;
-
       try {
         const changerName = appUser?.name || "System";
         const details = reason
@@ -1538,13 +1808,7 @@ If you cannot determine a field, use null for that field.`
         try {
           const submitter = await storage.getUser(po.submitterId);
           if (submitter?.managerId) {
-            const managerChain: any[] = [];
-            let currentUser = submitter;
-            while (currentUser?.managerId) {
-              const mgr = await storage.getUser(currentUser.managerId);
-              if (mgr) managerChain.push(mgr);
-              currentUser = mgr as any;
-            }
+            const managerChain = await buildManagerChain(submitter);
 
             const nextApprover = managerChain.find(m => m.role === "General Manager");
 
@@ -1667,6 +1931,8 @@ If you cannot determine a field, use null for that field.`
   app.post("/api/purchase-orders/:id/comments", async (req, res) => {
     const parsed = insertPoCommentSchema.safeParse({ ...req.body, purchaseOrderId: req.params.id });
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+    const po = await storage.getPurchaseOrder(req.params.id);
+    if (!po) return res.status(404).json({ message: "Purchase order not found" });
     const comment = await storage.createPoComment(parsed.data);
     res.status(201).json(comment);
   });

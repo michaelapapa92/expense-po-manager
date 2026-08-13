@@ -2,7 +2,11 @@
 
 ## Overview
 
-ReimburseFlow is a full-stack expense reporting and approval workflow application. Employees can submit expense reports, which then flow through a multi-tier approval process (Manager → General Manager → QuickBooks Bill Creation → Reimbursed). GM submissions go through Executive Chairman → QuickBooks Bill Creation → Reimbursed. The Accounts Payable stage has been removed; GM/EC approval now directly triggers QuickBooks bill creation. The app features role-based views with a reporting structure (managerId on users), a dashboard with clickable summary cards, expense creation forms, approval queues filtered by direct reports, and admin user management with admin privileges separated from roles. Submitters can cancel or edit their own expenses at any stage (except Reimbursed/Cancelled). Editing a post-approval expense resets it to "Submitted" to restart the full approval process. Server-side ownership checks enforce that only the submitter can cancel or edit their own expenses. Expense history/audit trail tracks all changes (creation, status changes, edits).
+ReimburseFlow is a full-stack expense reporting and approval workflow application.
+
+**Every workflow ends at the General Manager.** The Executive Chairman is involved in exactly one case: a report submitted by the GM themselves. So an employee's report goes Manager → GM → QuickBooks bill → Reimbursed; the GM's own goes EC → QuickBooks bill → Reimbursed; and the EC's own goes to the GM. A direct report of the GM needs one approval, not two — the GM approving as their manager finalises it. Purchase orders always end at the GM and never reach the EC. The Accounts Payable stage has been removed (its status values survive on historical rows); final approval directly triggers QuickBooks bill creation.
+
+These rules are enforced server-side in `canTransitionExpense` / `canTransitionPo` (`server/routes.ts`) and covered by `server/approval-rules.test.ts`. Nobody may approve their own submission, including admins, and stages cannot be skipped. The app features role-based views with a reporting structure (managerId on users), a dashboard with clickable summary cards, expense creation forms, approval queues filtered by direct reports, and admin user management with admin privileges separated from roles. Submitters can cancel or edit their own expenses at any stage (except Reimbursed/Cancelled). Editing a post-approval expense resets it to "Submitted" to restart the full approval process. Server-side ownership checks enforce that only the submitter can cancel or edit their own expenses. Expense history/audit trail tracks all changes (creation, status changes, edits).
 
 ## User Preferences
 
@@ -20,21 +24,21 @@ Preferred communication style: Simple, everyday language.
 - **Path aliases**: `@/` maps to `client/src/`, `@shared/` maps to `shared/`
 
 **Key pages:**
-- `/` — Dashboard with expense summaries and statistics (when authenticated), Landing page (when not)
+- `/` — Dashboard with expense summaries and statistics (when authenticated), Login page (when not)
 - `/new-expense` — Expense creation form with validation (zod + react-hook-form)
 - `/approvals` — "Action Needed" page: unified view with three tabs — Pending Review (expense/PO approvals), My Items (drafts, rejected expenses, POs needing info — all clickable), and History
 - `/admin/users` — Admin panel for managing user roles
 
-**Authentication**: OpenID Connect (OIDC) via OneLogin SSO. Users sign in through OneLogin (impulse.onelogin.com). Sessions managed via passport + connect-pg-simple for PostgreSQL-backed sessions. Landing page shown when unauthenticated; session checked via GET /api/auth/user. Users are matched to existing app users by email (via `oidcId` field). New OIDC users automatically get a default Employee role. Secrets: `ONELOGIN_CLIENT_ID`, `ONELOGIN_CLIENT_SECRET`, `ONELOGIN_ISSUER_URL`.
+**Authentication**: OpenID Connect (OIDC) via OneLogin SSO. Users sign in through OneLogin (impulse.onelogin.com). Sessions managed via passport + connect-pg-simple for PostgreSQL-backed sessions. Login page shown when unauthenticated; session checked via GET /api/auth/user. Users are matched to existing app users by email (via `oidcId` field). New OIDC users automatically get a default Employee role. Secrets: `ONELOGIN_CLIENT_ID`, `ONELOGIN_CLIENT_SECRET`, `ONELOGIN_ISSUER_URL`.
 
-**Role system**: Four roles — Employee, Manager, General Manager, Executive Chairman. Admin is a separate boolean flag (`isAdmin`) on any user. The `isAccountsPayable` flag still exists in the database but is no longer used in the approval workflow (AP stage removed). User identity comes from OIDC session. Managers only see approvals from their direct reports (via managerId reporting structure). Admin page access is controlled by `isAdmin` flag.
+**Role system**: Four roles — Employee, Manager, General Manager, Executive Chairman. Admin is a separate boolean flag (`isAdmin`) on any user; admins may act out of turn but still cannot approve their own submissions, nor apply a stage an expense does not have. `isAccountsPayable` no longer gates an approval stage (the AP stage is retired) but does permit marking an expense Reimbursed. User identity comes from OIDC session. Managers only see approvals from their direct reports (via managerId reporting structure). Admin page access is controlled by `isAdmin` flag.
 
 ### Backend
 
 - **Framework**: Express 5 on Node.js with TypeScript (run via tsx)
 - **API pattern**: RESTful JSON API under `/api/` prefix
 - **Server entry**: `server/index.ts` creates an HTTP server, sets up OIDC auth (setupAuth + registerAuthRoutes), registers routes, and serves static files in production or uses Vite dev middleware in development
-- **Auth integration**: `server/replit_integrations/auth/` — OIDC setup via passport, session management, user upsert by oidcId/email matching
+- **Auth integration**: `server/auth/` — OIDC setup via passport, session management, user upsert by oidcId/email matching
 
 **API endpoints:**
 - `GET /api/login` — Begin OIDC login flow (redirects to provider)
@@ -54,7 +58,7 @@ Preferred communication style: Simple, everyday language.
 - `GET /api/notifications/unread-count` — Get unread notification count
 - `PATCH /api/notifications/:id/read` — Mark a notification as read
 - `POST /api/notifications/mark-all-read` — Mark all notifications as read
-- `POST /api/scan-receipt` — AI-powered receipt scanning with GPT-4o (uses dynamic categories)
+- `POST /api/scan-receipt` — Receipt scanning via local Tesseract OCR (`server/receipt-ocr.ts`), matched against the active categories. No API key and no per-scan cost; **requires the `tesseract` binary on PATH**.
 - `GET /api/categories` — List active expense categories (public)
 - `POST /api/categories` — Create a new category (admin-only)
 - `DELETE /api/categories/:id` — Delete a category (admin-only)
@@ -82,12 +86,53 @@ Preferred communication style: Simple, everyday language.
 
 The `shared/` directory contains the database schema and Zod validation schemas used by both the frontend and backend. This ensures type safety across the stack. Key exports include `insertUserSchema`, `insertExpenseSchema`, `insertCommentSchema`, and TypeScript types for all entities.
 
+### Running it locally
+
+Prerequisites: Node 20+, PostgreSQL, and the **`tesseract`** binary (`brew install tesseract`) for receipt scanning.
+
+```bash
+createdb expense_po_manager        # plus a role, see DATABASE_URL below
+npm install
+npm run db:push                    # creates the tables from shared/schema.ts
+npm run dev                        # http://localhost:$PORT
+```
+
+`npm run dev` and `npm run db:push` source `.env` (gitignored). Minimum to boot:
+
+| Variable | Notes |
+|---|---|
+| `DATABASE_URL` | Postgres connection string |
+| `PORT` | Note: **5000 is taken by AirPlay Receiver on macOS**; 5001 works |
+| `APP_URL` | Required in production — see below |
+| `SESSION_SECRET` | Any long random string |
+| `BYPASS_AUTH` | `true` for local dev — see below |
+
+Everything else (`QBO_*`, `MS_*`, `WEBEX_BOT_TOKEN`, `GUSTO_*`, `ONELOGIN_*`) is optional; the features degrade quietly when unset.
+
+**`BYPASS_AUTH=true`** skips OneLogin entirely: `setupAuth` is not called (`server/index.ts`) and every request is treated as `mpapa@aseva.com` from the seed data. It exists so the app runs locally without real SSO credentials. It must never be set in a deployed environment — it disables all authentication, and `requireAuth` short-circuits on it.
+
+**`APP_URL`** builds the OneLogin OIDC callback, the post-logout redirect, and the QuickBooks OAuth `redirect_uri`, all of which must exactly match what is registered with those providers. `getAppUrl()` (`server/app-url.ts`) therefore **throws at startup in production if it is unset**, rather than falling back to a wrong value.
+
 ### Build & Development
 
-- **Dev mode**: `npm run dev` runs the Express server with Vite middleware for HMR
+- **Dev mode**: `npm run dev` runs the Express server with Vite middleware for HMR, under `tsx watch` so server changes reload
 - **Production build**: `npm run build` runs Vite for the client and esbuild for the server, outputting to `dist/`
-- **Production start**: `npm start` serves the built files from `dist/`
-- **Type checking**: `npm run check` runs TypeScript compiler
+- **Production start**: `npm start` serves the built files from `dist/` (`node dist/index.cjs`, static root `dist/public`)
+- **Type checking**: `npm run check`. Server code is clean; there are pre-existing client-side errors, mostly in `purchase-orders.tsx`, which imports its types from `@/lib/mockData` rather than `@shared/schema`
+- **Approval rules**: `npx tsx server/approval-rules.test.ts`
+
+### Deployment notes
+
+- Install the `tesseract` binary on the host (e.g. `apt-get install tesseract-ocr`), or receipt scanning returns an error and users fall back to manual entry.
+- Set `APP_URL` to the real public origin, and give IT that origin so the OneLogin app's callback (`<APP_URL>/api/callback`) and the Intuit app's redirect URI (`<APP_URL>/api/quickbooks/callback`) match.
+- Do **not** set `BYPASS_AUTH`.
+- Run `npm run db:push` against the production database before first boot.
+
+### Webex Notifications
+
+- **Service module**: `server/webex.ts` — direct messages via a Webex bot
+- **Secret**: `WEBEX_BOT_TOKEN`; disabled when unset
+- **Trigger points**: the same events as email, sent to users with `notifyWebex=true`, addressed by email
 
 ### Email Notifications
 
@@ -99,7 +144,7 @@ The `shared/` directory contains the database schema and Zod validation schemas 
 - **Trigger points**: Email sent alongside in-app notifications when user has `notifyEmail=true`:
   - New expense submitted → manager gets email
   - Expense approved/rejected/reimbursed → submitter gets email (with rejection note if applicable)
-  - Expense advances approval chain (Manager Approved → GM, GM Approved → EC) → next approver gets email
+  - Expense advances to the final approver (Manager Approved → GM, or → EC for a report the GM submitted) → that approver gets email. Final approval is the end of the chain; there is no notification after it.
   - New comment on expense → submitter gets email
   - Bulk status changes → each affected submitter gets email
 - **Email templates**: Branded HTML emails with Aseva navy/teal colors, responsive layout
@@ -169,8 +214,7 @@ The `shared/` directory contains the database schema and Zod validation schemas 
 
 - **PostgreSQL** — Primary database, connected via `DATABASE_URL` environment variable
 - **Google Fonts** — Inter and Space Grotesk loaded from `fonts.googleapis.com`
-- **Replit plugins** — `@replit/vite-plugin-runtime-error-modal`, `@replit/vite-plugin-cartographer`, `@replit/vite-plugin-dev-banner` (development only)
 - **Authentication** — OIDC via OneLogin SSO (openid-client, passport), express-session with connect-pg-simple for PostgreSQL-backed sessions
-- **AI** — OpenAI GPT-4o for receipt scanning (via AI Integrations)
+- **Tesseract OCR** — receipt scanning, via the `tesseract` binary (`brew install tesseract` locally; on a deployment host this must be installed explicitly, e.g. `apt-get install tesseract-ocr`). This is a **system prerequisite**, not an npm dependency.
 - **Email** — Microsoft Graph API via @azure/identity and @microsoft/microsoft-graph-client for M365 email notifications
 - **QuickBooks Online** — Intuit OAuth 2.0 + REST API for bill creation and payment sync
