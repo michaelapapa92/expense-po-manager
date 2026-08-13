@@ -1,0 +1,66 @@
+1. Which of the following is true about your app (at least one option must be checked):
+App Scratch
+You built your app from scratch and wrote the code that lets it interact with Intuit APIs and data
+App Team Building
+You used another platform or tool to build and code your app
+What's the name of the platform or tool?
+App Team Platform
+
+
+Replit
+Provide a link to the platform or tool’s website
+App Team URL
+https://replit.com/
+Describe how your app interacts with the platform
+App Team Details
+Font
+
+Salesforce Sans
+Font Size
+
+12
+Replit vibecodes the app using agentic AI
+
+
+
+App Integration Tool
+Your app acts as a platform that lets other app developers (outside your team or company) integrate with QuickBooks
+App Creation
+You require your app users to create an additional app or profile on the Intuit Developer platform in order to use your app
+App Instructed
+You were asked to create this app in order to get credentials/keys to be used on another platform that integrates with QuickBooks
+2. What platform(s) does your app utilize and make API calls from? (Select all that apply)
+App Platform
+Item Web/Browser moved to the list ChosenPress Ctrl (Cmd on Mac) + Left Arrow or Ctrl (Cmd on Mac) + Right Arrow to move items between lists. Supports single character navigation. Press CTRL + Space key to select the option.
+Available
+Web/SaaS
+Mobile
+Desktop app connecting to QuickBooks Online
+Chosen
+Web/Browser
+
+3. How does your app interact with Intuit product data? (Select all that apply)
+App Interaction
+Item It writes data to Intuit product(s) (including Charge/ECheck transactions for payment processing) moved to the list ChosenPress Ctrl (Cmd on Mac) + Left Arrow or Ctrl (Cmd on Mac) + Right Arrow to move items between lists. Supports single character navigation. Press CTRL + Space key to select the option.
+Available
+It reads data from Intuit product(s)
+It deletes data from Intuit product(s)
+Other (specify)
+Chosen
+It writes data to Intuit product(s) (including Charge/ECheck transactions for payment processing)
+
+4. Are you building a private app for your team or business? Or, do you plan to make it publicly available?
+App Private
+
+We're building a private app
+
+5. Which types of QuickBooks Online users can use your app?
+App User Types
+
+Any user of the QuickBooks Online company
+
+6. Does your app integrate with platforms other than Intuit?
+App Large Platform
+
+No
+
