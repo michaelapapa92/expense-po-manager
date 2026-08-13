@@ -64,6 +64,105 @@ function getAllSubordinateIds(userId: string, allUsers: any[]): string[] {
   return subordinates;
 }
 
+/**
+ * Aseva's approval chain: every workflow ends at the General Manager, except a
+ * report submitted by the GM, which ends at the Executive Chairman.
+ *
+ * The submitter's own manager reviews first, unless that manager is already the
+ * final approver -- a direct report of the GM needs one approval, not two.
+ */
+export function expenseApprovalPlan(submitter: any, allUsers: any[]) {
+  const finalRole = submitter.role === "General Manager" ? "Executive Chairman" : "General Manager";
+  const finalApprover = allUsers.find(u => u.role === finalRole) || null;
+  const finalStatus: ExpenseStatus = finalRole === "Executive Chairman" ? "EC Approved" : "GM Approved";
+  const finalRejected: ExpenseStatus = finalRole === "Executive Chairman" ? "EC Rejected" : "GM Rejected";
+
+  const directManager = submitter.managerId
+    ? allUsers.find(u => u.id === submitter.managerId) || null
+    : null;
+  const needsManagerStage = !!directManager && (!finalApprover || directManager.id !== finalApprover.id);
+
+  return { finalApprover, finalStatus, finalRejected, directManager, needsManagerStage };
+}
+
+/**
+ * Decides whether `actor` may move `expense` to `newStatus`.
+ * Admins may act out of turn to unstick things, but nobody -- admin included --
+ * may approve their own report.
+ */
+export function canTransitionExpense(
+  actor: any,
+  expense: any,
+  newStatus: ExpenseStatus,
+  plan: ReturnType<typeof expenseApprovalPlan>,
+): { ok: true } | { ok: false; status: number; message: string } {
+  const deny = (message: string, status = 403) => ({ ok: false as const, status, message });
+  const isSubmitter = actor.id === expense.employeeId;
+  const current = expense.status as ExpenseStatus;
+
+  // Submitter-only transitions.
+  if (newStatus === "Cancelled") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can cancel their own expense");
+    return { ok: true };
+  }
+  if (newStatus === "Draft" || newStatus === "Submitted") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can submit their own expense");
+    return { ok: true };
+  }
+
+  // Everything below is an approval decision.
+  if (isSubmitter) return deny("You cannot approve or reject your own expense");
+
+  const isManagerStage = newStatus === "Manager Approved" || newStatus === "Manager Rejected";
+  const isFinalStage = newStatus === plan.finalStatus || newStatus === plan.finalRejected;
+
+  if (isManagerStage) {
+    if (!plan.needsManagerStage) {
+      return deny("This expense does not need a separate manager review");
+    }
+    if (current !== "Submitted") return deny(`Cannot move an expense from ${current} to ${newStatus}`, 409);
+    if (!actor.isAdmin && actor.id !== plan.directManager?.id) {
+      return deny("Only the submitter's manager can review this expense");
+    }
+    return { ok: true };
+  }
+
+  if (isFinalStage) {
+    // "Manager Approved" is always a valid predecessor, even when this expense
+    // would not have required a manager stage today -- rows predating a change
+    // of manager (or of these rules) sit there and must stay approvable.
+    // Requiring it when a manager stage IS needed is what stops stage-skipping.
+    const allowedFrom = plan.needsManagerStage
+      ? ["Manager Approved"]
+      : ["Submitted", "Manager Approved"];
+    if (!allowedFrom.includes(current)) {
+      return deny(`Cannot move an expense from ${current} to ${newStatus}`, 409);
+    }
+    if (!actor.isAdmin && actor.id !== plan.finalApprover?.id) {
+      return deny(`Only the ${plan.finalApprover?.role ?? "final approver"} can approve this expense`);
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "Reimbursed") {
+    if (!actor.isAdmin && !actor.isAccountsPayable) {
+      return deny("Only Accounts Payable or an admin can mark an expense reimbursed");
+    }
+    return { ok: true };
+  }
+
+  // The AP stage is retired but the statuses survive on historical rows.
+  if (newStatus === "Accounts Payable" || newStatus === "AP Rejected") {
+    if (!actor.isAdmin) return deny(`${newStatus} is no longer part of the approval flow`);
+    return { ok: true };
+  }
+
+  // What is left is an approval status from the branch this expense does not
+  // take -- e.g. EC Approved on an employee's report, which ends at the GM.
+  // Admins may act out of turn, but not invent a stage this expense never has.
+  return deny(`${newStatus} is not a valid step for this expense`);
+}
+
 /** Walks up the reporting line from `user`. Cycle-safe: a loop in the manager
  *  graph would otherwise spin forever, re-querying the same rows. */
 async function buildManagerChain(user: any): Promise<any[]> {
@@ -108,6 +207,13 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+
+  // Everything below is authenticated by default. Auth was previously opt-in
+  // per route and most routes simply never opted in, leaving expense approval,
+  // PO editing and the employee directory reachable with no session at all.
+  // The OIDC routes (/api/login, /api/callback, /api/logout) and /api/auth/user
+  // are registered in index.ts *before* this call, so they stay public.
+  app.use("/api", requireAuth);
 
   app.get("/api/users", requireAuth, async (_req, res) => {
     const users = await storage.getUsers();
@@ -544,29 +650,37 @@ export async function registerRoutes(
   });
 
   app.patch("/api/expenses/:id/status", async (req, res) => {
-    const { status, userId } = req.body;
+    const { status } = req.body;
     const parsed = statusEnum.safeParse(status);
     if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
 
     const expense = await storage.getExpense(req.params.id);
     if (!expense) return res.status(404).json({ message: "Expense not found" });
 
-    if (status === "Cancelled") {
-      if (!userId || expense.employeeId !== userId) {
-        return res.status(403).json({ message: "Only the submitter can cancel their own expense" });
-      }
-      if (expense.status === "Reimbursed" || expense.status === "Cancelled") {
-        return res.status(400).json({ message: "Cannot cancel an expense that is already reimbursed or cancelled" });
-      }
+    // Identity comes from the session, never from the request body -- the old
+    // `userId` field let a caller nominate whoever they liked.
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    const newStatus = parsed.data as ExpenseStatus;
+
+    if (newStatus === "Cancelled" &&
+        (expense.status === "Reimbursed" || expense.status === "Cancelled")) {
+      return res.status(400).json({ message: "Cannot cancel an expense that is already reimbursed or cancelled" });
     }
+
+    const allUsers = await storage.getUsers();
+    const submitter = allUsers.find(u => u.id === expense.employeeId);
+    if (!submitter) return res.status(404).json({ message: "Submitter not found" });
+    const plan = expenseApprovalPlan(submitter, allUsers);
+
+    const verdict = canTransitionExpense(appUser, expense, newStatus, plan);
+    if (!verdict.ok) return res.status(verdict.status).json({ message: verdict.message });
 
     const oldStatus = expense.status;
     const updated = await storage.updateExpenseStatus(req.params.id, parsed.data);
 
     if (updated) {
-      const newStatus = parsed.data as ExpenseStatus;
-      const appUser = await getAppUser(req);
-
       try {
         const changerName = appUser?.name || "System";
         await storage.createExpenseHistory({
@@ -673,55 +787,47 @@ export async function registerRoutes(
         createBillForExpense(expense).catch(e => console.error("[quickbooks] Bill creation error:", e));
       }
 
-      if (newStatus === "Manager Approved" || newStatus === "GM Approved" || newStatus === "EC Approved") {
+      // Only the manager stage has someone after it. `plan.finalStatus` is the
+      // end of the line -- the expense goes to QuickBooks from there, not on to
+      // another approver.
+      if (newStatus === "Manager Approved") {
         try {
-          const submitter = await storage.getUser(expense.employeeId);
-          if (submitter?.managerId) {
-            const managerChain = await buildManagerChain(submitter);
+          const nextApprover = plan.finalApprover;
+          const stage = `${plan.finalApprover?.role ?? "Final"} Review`;
 
-            let nextApprover = null;
-            if (newStatus === "Manager Approved") {
-              nextApprover = managerChain.find(m => m.role === "General Manager" || m.role === "Executive Chairman");
-            } else if (newStatus === "GM Approved") {
-              nextApprover = managerChain.find(m => m.role === "Executive Chairman");
-            }
+          if (nextApprover && nextApprover.id !== appUser?.id) {
+            await storage.createNotification({
+              userId: nextApprover.id,
+              type: "approval_needed",
+              title: "Expense Awaiting Your Approval",
+              message: `${expense.employeeName}'s expense "${expense.description}" ($${expense.amount}) needs your review (${stage})`,
+              expenseId: expense.id,
+              isRead: false,
+            });
+          }
 
-            const stage = newStatus === "Manager Approved" ? "GM Review" : "Executive Chairman Review";
-
-            if (nextApprover && nextApprover.id !== appUser?.id) {
-              await storage.createNotification({
-                userId: nextApprover.id,
-                type: "approval_needed",
-                title: "Expense Awaiting Your Approval",
-                message: `${expense.employeeName}'s expense "${expense.description}" ($${expense.amount}) needs your review (${stage})`,
-                expenseId: expense.id,
-                isRead: false,
-              });
-            }
-
-            if (nextApprover?.notifyEmail && nextApprover.email) {
-              const emailData = buildApprovalNeededEmail({
-                approverName: nextApprover.name,
-                employeeName: expense.employeeName,
-                description: expense.description,
-                amount: expense.amount,
-                stage,
-                expenseId: expense.id,
-              });
-              sendEmail({ to: nextApprover.email, ...emailData }).catch(e => console.error("[email] Error:", e));
-            }
-            if (nextApprover?.notifyWebex && nextApprover?.email) {
-              const webexMsg = buildWebexApprovalNeeded({
-                approverName: nextApprover.name,
-                employeeName: expense.employeeName,
-                description: expense.description,
-                amount: expense.amount,
-                stage,
-                notes: expense.notes,
-                expenseId: expense.id,
-              });
-              sendWebexDirectMessage(nextApprover.email, webexMsg).catch(e => console.error("[webex] Error:", e));
-            }
+          if (nextApprover?.notifyEmail && nextApprover.email) {
+            const emailData = buildApprovalNeededEmail({
+              approverName: nextApprover.name,
+              employeeName: expense.employeeName,
+              description: expense.description,
+              amount: expense.amount,
+              stage,
+              expenseId: expense.id,
+            });
+            sendEmail({ to: nextApprover.email, ...emailData }).catch(e => console.error("[email] Error:", e));
+          }
+          if (nextApprover?.notifyWebex && nextApprover?.email) {
+            const webexMsg = buildWebexApprovalNeeded({
+              approverName: nextApprover.name,
+              employeeName: expense.employeeName,
+              description: expense.description,
+              amount: expense.amount,
+              stage,
+              notes: expense.notes,
+              expenseId: expense.id,
+            });
+            sendWebexDirectMessage(nextApprover.email, webexMsg).catch(e => console.error("[webex] Error:", e));
           }
         } catch (e) {
           console.error("Failed to send next-approver notification email:", e);
@@ -744,18 +850,21 @@ export async function registerRoutes(
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
 
     const allUsers = await storage.getUsers();
-    const subordinateIds = getAllSubordinateIds(appUser.id, allUsers);
-    const isManager = appUser.role === "Manager" || appUser.role === "General Manager" || appUser.role === "Executive Chairman";
-    const isAdmin = appUser.isAdmin;
 
     const oldExpenses = await Promise.all(expenseIds.map((id: string) => storage.getExpense(id)));
     const validExpenses = oldExpenses.filter(e => e != null);
 
+    // Same rules as the single-expense endpoint, so approving in bulk cannot be
+    // used to skip a stage or self-approve.
     for (const expense of validExpenses) {
-      const isSubordinate = subordinateIds.includes(expense.employeeId);
-      const canApprove = isAdmin || (isManager && isSubordinate);
-      if (!canApprove) {
-        return res.status(403).json({ message: `Not authorized to update expense "${expense.description}"` });
+      const submitter = allUsers.find(u => u.id === expense.employeeId);
+      if (!submitter) {
+        return res.status(404).json({ message: `Submitter not found for "${expense.description}"` });
+      }
+      const plan = expenseApprovalPlan(submitter, allUsers);
+      const verdict = canTransitionExpense(appUser, expense, parsed.data as ExpenseStatus, plan);
+      if (!verdict.ok) {
+        return res.status(verdict.status).json({ message: `"${expense.description}": ${verdict.message}` });
       }
     }
 
