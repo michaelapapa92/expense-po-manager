@@ -76,6 +76,7 @@ export interface IStorage {
 
   getAttachmentsByExpense(expenseId: string): Promise<ExpenseAttachment[]>;
   createAttachment(attachment: InsertExpenseAttachment): Promise<ExpenseAttachment>;
+  getAttachment(id: string): Promise<ExpenseAttachment | undefined>;
   deleteAttachment(id: string): Promise<boolean>;
 
   bulkUpdateExpenseStatus(ids: string[], status: string): Promise<Expense[]>;
@@ -347,6 +348,11 @@ export class DatabaseStorage implements IStorage {
   async createAttachment(attachment: InsertExpenseAttachment): Promise<ExpenseAttachment> {
     const [created] = await db.insert(expenseAttachments).values(attachment).returning();
     return created;
+  }
+
+  async getAttachment(id: string): Promise<ExpenseAttachment | undefined> {
+    const [found] = await db.select().from(expenseAttachments).where(eq(expenseAttachments.id, id));
+    return found;
   }
 
   async deleteAttachment(id: string): Promise<boolean> {

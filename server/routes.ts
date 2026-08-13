@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { authStorage } from "./replit_integrations/auth";
-import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
+import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, type POStatus, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
 import { z } from "zod";
 import { scanReceiptImage } from "./receipt-ocr";
 import { sendEmail, buildExpenseSubmittedEmail, buildStatusChangeEmail, buildCommentEmail, buildApprovalNeededEmail } from "./email";
@@ -161,6 +161,109 @@ export function canTransitionExpense(
   // take -- e.g. EC Approved on an employee's report, which ends at the GM.
   // Admins may act out of turn, but not invent a stage this expense never has.
   return deny(`${newStatus} is not a valid step for this expense`);
+}
+
+/**
+ * Purchase orders always end at the General Manager -- they never go to the
+ * Executive Chairman. After GM approval the PO Admin places the order.
+ */
+export function poApprovalPlan(submitter: any, allUsers: any[]) {
+  const gm = allUsers.find(u => u.role === "General Manager") || null;
+  const poAdmin = allUsers.find(u => u.isPOAdmin) || null;
+  const directManager = submitter.managerId
+    ? allUsers.find(u => u.id === submitter.managerId) || null
+    : null;
+  const needsManagerStage = !!directManager && (!gm || directManager.id !== gm.id);
+  return { gm, poAdmin, directManager, needsManagerStage };
+}
+
+export function canTransitionPo(
+  actor: any,
+  po: any,
+  newStatus: POStatus,
+  plan: ReturnType<typeof poApprovalPlan>,
+): { ok: true } | { ok: false; status: number; message: string } {
+  const deny = (message: string, status = 403) => ({ ok: false as const, status, message });
+  const isSubmitter = actor.id === po.submitterId;
+  const current = po.status as POStatus;
+
+  if (newStatus === "Cancelled") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can cancel their own PO");
+    return { ok: true };
+  }
+  if (newStatus === "Draft" || newStatus === "Submitted") {
+    if (!isSubmitter && !actor.isAdmin) return deny("Only the submitter can submit their own PO");
+    return { ok: true };
+  }
+
+  // Purchase orders stop at the GM.
+  if (newStatus === "EC Approved" || newStatus === "EC Rejected") {
+    return deny("Purchase orders are not approved by the Executive Chairman");
+  }
+
+  if (isSubmitter) return deny("You cannot review your own purchase order");
+
+  const isPoAdminActor = actor.isPOAdmin || actor.isAdmin;
+
+  if (newStatus === "PO Admin Review" || newStatus === "More Info Requested") {
+    if (!isPoAdminActor && actor.id !== plan.directManager?.id && actor.id !== plan.gm?.id) {
+      return deny("Only the PO Administrator or an approver can review this PO");
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "PO Admin Rejected") {
+    return deny("PO Administrators cannot reject purchase orders. Use 'Request More Info' instead.");
+  }
+
+  if (newStatus === "Manager Approved" || newStatus === "Manager Rejected") {
+    if (!plan.needsManagerStage) return deny("This PO does not need a separate manager review");
+    if (!actor.isAdmin && actor.id !== plan.directManager?.id) {
+      return deny("Only the submitter's manager can review this PO");
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "GM Approved" || newStatus === "GM Rejected") {
+    if (!actor.isAdmin && actor.id !== plan.gm?.id) {
+      return deny("Only the General Manager can give final approval on a PO");
+    }
+    // Approving out of order would skip the manager entirely; rejecting is
+    // always allowed, since stopping a PO early is never harmful.
+    if (newStatus === "GM Approved" && plan.needsManagerStage && current !== "Manager Approved") {
+      return deny(`Cannot move a PO from ${current} to GM Approved before manager review`, 409);
+    }
+    return { ok: true };
+  }
+
+  if (newStatus === "Ordering" || newStatus === "Order Placed") {
+    if (!isPoAdminActor) return deny("Only the PO Administrator can place the order");
+    if (current !== "GM Approved" && current !== "Ordering") {
+      return deny(`Cannot place an order for a PO at ${current}; it needs GM approval first`, 409);
+    }
+    return { ok: true };
+  }
+
+  return deny(`${newStatus} is not a valid step for this purchase order`);
+}
+
+/** Yours, one of your reports', or you are an admin. */
+async function canViewExpense(appUser: any, expense: any): Promise<boolean> {
+  if (appUser.isAdmin) return true;
+  if (expense.employeeId === appUser.id) return true;
+  const allUsers = await storage.getUsers();
+  return getAllSubordinateIds(appUser.id, allUsers).includes(expense.employeeId);
+}
+
+/**
+ * `viewAsUserId` is an admin impersonation aid. The expense routes always
+ * gated it on isAdmin; the notification routes did not, so any signed-in
+ * employee could read -- and mark read -- a colleague's notifications.
+ */
+function resolveNotificationTarget(req: any, appUser: any): string {
+  const requested = req.query.viewAsUserId as string | undefined;
+  if (requested && appUser.isAdmin) return requested;
+  return appUser.id;
 }
 
 /** Walks up the reporting line from `user`. Cycle-safe: a loop in the manager
@@ -999,12 +1102,16 @@ export async function registerRoutes(
   });
 
   app.patch("/api/expenses/:id", async (req, res) => {
-    const { description, amount, date, category, notes, receiptUrl, status, userId, miles } = req.body;
+    const { description, amount, date, category, notes, receiptUrl, miles } = req.body;
 
     const expense = await storage.getExpense(req.params.id);
     if (!expense) return res.status(404).json({ message: "Expense not found" });
 
-    if (userId && expense.employeeId !== userId) {
+    // The ownership check used to read `userId` from the body, so omitting it
+    // skipped the check entirely. Identity comes from the session instead.
+    const editor = await getAppUser(req);
+    if (!editor) return res.status(401).json({ message: "Not authenticated" });
+    if (expense.employeeId !== editor.id && !editor.isAdmin) {
       return res.status(403).json({ message: "Only the submitter can edit their own expense" });
     }
 
@@ -1020,10 +1127,13 @@ export async function registerRoutes(
     if (notes !== undefined) updateData.notes = notes;
     if (receiptUrl !== undefined) updateData.receiptUrl = receiptUrl;
     if (miles !== undefined) updateData.miles = miles;
-    if (status !== undefined) {
-      const parsed = statusEnum.safeParse(status);
-      if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
-      updateData.status = parsed.data;
+
+    // Any status the client sends is ignored -- accepting it made this a second,
+    // unguarded way to approve an expense. The reset is decided here instead:
+    // editing an expense that already moved past Draft restarts its approval,
+    // which is the documented behaviour and what the edit form expects.
+    if (expense.status !== "Draft") {
+      updateData.status = "Submitted";
     }
     const oldStatus = expense.status;
     const updated = await storage.updateExpense(req.params.id, updateData);
@@ -1072,7 +1182,7 @@ export async function registerRoutes(
   app.get("/api/notifications", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const notifs = await storage.getNotificationsByUser(targetUserId);
     res.json(notifs);
   });
@@ -1080,7 +1190,7 @@ export async function registerRoutes(
   app.get("/api/notifications/unread-count", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const count = await storage.getUnreadNotificationCount(targetUserId);
     res.json({ count });
   });
@@ -1088,7 +1198,7 @@ export async function registerRoutes(
   app.patch("/api/notifications/:id/read", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     const notif = await storage.markNotificationReadForUser(req.params.id, targetUserId);
     if (!notif) return res.status(404).json({ message: "Notification not found" });
     res.json(notif);
@@ -1097,12 +1207,23 @@ export async function registerRoutes(
   app.post("/api/notifications/mark-all-read", async (req, res) => {
     const appUser = await getAppUser(req);
     if (!appUser) return res.status(401).json({ message: "Not authenticated" });
-    const targetUserId = (req.query.viewAsUserId as string) || appUser.id;
+    const targetUserId = resolveNotificationTarget(req, appUser);
     await storage.markAllNotificationsRead(targetUserId);
     res.json({ success: true });
   });
 
   app.get("/api/expenses/:expenseId/attachments", requireAuth, async (req, res) => {
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    // Receipts routinely show home addresses and card fragments, so they follow
+    // the same visibility rule as the expense: yours, your reports', or admin.
+    const expense = await storage.getExpense(req.params.expenseId);
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+    if (!(await canViewExpense(appUser, expense))) {
+      return res.status(403).json({ message: "Not authorized to view these attachments" });
+    }
+
     const attachments = await storage.getAttachmentsByExpense(req.params.expenseId);
     res.json(attachments);
   });
@@ -1125,6 +1246,18 @@ export async function registerRoutes(
   });
 
   app.delete("/api/attachments/:id", requireAuth, async (req, res) => {
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+
+    // Deleting a receipt destroys the evidence behind an expense, so this is
+    // the submitter's own call (or an admin's) -- not a reviewer's.
+    const attachment = await storage.getAttachment(req.params.id);
+    if (!attachment) return res.status(404).json({ message: "Attachment not found" });
+    const parent = await storage.getExpense(attachment.expenseId);
+    if (parent && parent.employeeId !== appUser.id && !appUser.isAdmin) {
+      return res.status(403).json({ message: "Not authorized to delete this attachment" });
+    }
+
     const deleted = await storage.deleteAttachment(req.params.id);
     if (!deleted) return res.status(404).json({ message: "Attachment not found" });
     res.json({ message: "Attachment deleted successfully" });
@@ -1498,56 +1631,75 @@ export async function registerRoutes(
     res.status(201).json(po);
   });
 
+  // Only these columns may be edited. req.body used to be handed to the update
+  // wholesale, which let a caller rewrite status, submitterId, poNumber or
+  // totalCost -- routing around the approval workflow entirely.
+  const PO_EDITABLE_FIELDS = [
+    "vendor", "usage", "description", "cost", "tax", "shipping", "totalCost",
+    "billingFrequency", "recurringFrequency", "recurringTerm",
+    "projectName", "keyStakeholder", "notes",
+  ] as const;
+
   app.put("/api/purchase-orders/:id", async (req, res) => {
     const po = await storage.getPurchaseOrder(req.params.id);
     if (!po) return res.status(404).json({ message: "Purchase order not found" });
     if (po.status !== "Draft") return res.status(400).json({ message: "Can only edit draft purchase orders" });
-    const updated = await storage.updatePurchaseOrder(req.params.id, req.body);
+
+    const appUser = await getAppUser(req);
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
+    if (appUser.id !== po.submitterId && !appUser.isAdmin) {
+      return res.status(403).json({ message: "Only the submitter can edit their own purchase order" });
+    }
+
+    const updateData: Record<string, any> = {};
+    for (const field of PO_EDITABLE_FIELDS) {
+      if (req.body[field] !== undefined) updateData[field] = req.body[field];
+    }
+
+    const updated = await storage.updatePurchaseOrder(req.params.id, updateData);
     res.json(updated);
   });
 
   app.patch("/api/purchase-orders/:id/status", async (req, res) => {
-    const { status, userId, reason, paymentStatus } = req.body;
+    const { status, reason, paymentStatus } = req.body;
     const parsed = poStatusEnum.safeParse(status);
     if (!parsed.success) return res.status(400).json({ message: "Invalid status" });
 
     const po = await storage.getPurchaseOrder(req.params.id);
     if (!po) return res.status(404).json({ message: "Purchase order not found" });
 
-    const isRejectionOrInfo = status.includes("Rejected") || status === "More Info Requested";
+    const newStatus = parsed.data as POStatus;
+    const isRejectionOrInfo = newStatus.includes("Rejected") || newStatus === "More Info Requested";
     if (isRejectionOrInfo && (!reason || !reason.trim())) {
       return res.status(400).json({ message: "A reason is required when rejecting or requesting more info" });
     }
 
+    // Identity from the session, never from a `userId` in the body.
     const appUser = await getAppUser(req);
-    if (isRejectionOrInfo && appUser) {
-      const isActingPOAdmin = appUser.isPOAdmin && !['Manager', 'General Manager', 'Executive Chairman'].includes(appUser.role);
-      if (isActingPOAdmin && status.includes("Rejected")) {
-        return res.status(403).json({ message: "PO Administrators cannot reject purchase orders. Use 'Request More Info' instead." });
-      }
-    }
+    if (!appUser) return res.status(401).json({ message: "Not authenticated" });
 
-    if (status === "Order Placed") {
+    if (newStatus === "Order Placed") {
       if (!paymentStatus || !["paid", "accrual"].includes(paymentStatus)) {
         return res.status(400).json({ message: "Payment status ('paid' or 'accrual') is required when marking a PO as ordered" });
       }
     }
 
-    if (status === "Cancelled") {
-      if (!userId || po.submitterId !== userId) {
-        return res.status(403).json({ message: "Only the submitter can cancel their own PO" });
-      }
-      if (po.status === "Order Placed" || po.status === "Cancelled") {
-        return res.status(400).json({ message: "Cannot cancel a placed or cancelled PO" });
-      }
+    if (newStatus === "Cancelled" && (po.status === "Order Placed" || po.status === "Cancelled")) {
+      return res.status(400).json({ message: "Cannot cancel a placed or cancelled PO" });
     }
+
+    const allUsers = await storage.getUsers();
+    const submitter = allUsers.find(u => u.id === po.submitterId);
+    if (!submitter) return res.status(404).json({ message: "Submitter not found" });
+    const poPlan = poApprovalPlan(submitter, allUsers);
+
+    const verdict = canTransitionPo(appUser, po, newStatus, poPlan);
+    if (!verdict.ok) return res.status(verdict.status).json({ message: verdict.message });
 
     const oldStatus = po.status;
     const updated = await storage.updatePurchaseOrderStatus(req.params.id, parsed.data);
 
     if (updated) {
-      const newStatus = parsed.data;
-
       try {
         const changerName = appUser?.name || "System";
         const details = reason

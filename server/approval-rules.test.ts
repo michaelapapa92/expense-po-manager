@@ -5,7 +5,7 @@
  *
  * Run with: npx tsx server/approval-rules.test.ts
  */
-import { expenseApprovalPlan, canTransitionExpense } from "./routes";
+import { expenseApprovalPlan, canTransitionExpense, poApprovalPlan, canTransitionPo } from "./routes";
 
 const ec    = { id: "ec",    name: "Tony Papa",     role: "Executive Chairman", isAdmin: true,  managerId: null };
 const gm    = { id: "gm",    name: "Michael Papa",  role: "General Manager",    isAdmin: true,  managerId: "ec" };
@@ -87,6 +87,40 @@ allow("a stranger cannot cancel someone else's",    mgr, emp, "Submitted",      
 console.log("\nReimbursement");
 allow("AP marks reimbursed",                        ap,  emp, "GM Approved",       "Reimbursed",       true);
 allow("plain employee cannot mark reimbursed",      emp, mgr, "GM Approved",       "Reimbursed",       false);
+
+// ---------------------------------------------------------------- purchase orders
+
+const poAdmin = { id: "poadmin", name: "Dane Allen", role: "Employee", isAdmin: false, isPOAdmin: true, managerId: "mgr" };
+const PO_USERS = [...ALL, poAdmin];
+const po = (owner: any, status: string) => ({ id: "p", submitterId: owner.id, status, poNumber: "PO-00001" });
+
+function poAllow(label: string, actor: any, owner: any, from: string, to: string, expected: boolean) {
+  const plan = poApprovalPlan(owner, PO_USERS);
+  const v = canTransitionPo(actor, po(owner, from), to as any, plan);
+  check(label, v.ok, expected, v.ok ? "" : (v as any).message);
+}
+
+console.log("\nPOs never reach the Executive Chairman");
+poAllow("EC cannot approve a PO",                 ec,      emp, "Manager Approved", "EC Approved",     false);
+poAllow("not even an admin can",                  gm,      emp, "Manager Approved", "EC Approved",     false);
+poAllow("GM gives final PO approval",             gm,      emp, "Manager Approved", "GM Approved",     true);
+
+console.log("\nPO stages");
+poAllow("PO admin takes it for review",           poAdmin, emp, "Submitted",        "PO Admin Review", true);
+poAllow("manager approves after PO admin",        mgr,     emp, "PO Admin Review",  "Manager Approved", true);
+poAllow("GM cannot approve before the manager",   gm,      emp, "PO Admin Review",  "GM Approved",     false);
+poAllow("PO admin places the order after GM",     poAdmin, emp, "GM Approved",      "Order Placed",    true);
+poAllow("cannot place an order before GM signs",  poAdmin, emp, "Manager Approved", "Order Placed",    false);
+poAllow("a manager cannot place the order",       mgr,     emp, "GM Approved",      "Order Placed",    false);
+
+console.log("\nPO guards");
+poAllow("PO admin cannot reject, only ask info",  poAdmin, emp, "PO Admin Review",  "PO Admin Rejected", false);
+poAllow("PO admin can request more info",         poAdmin, emp, "PO Admin Review",  "More Info Requested", true);
+poAllow("submitter cannot review their own PO",   emp,     emp, "Submitted",        "PO Admin Review", false);
+poAllow("submitter cannot approve their own PO",  mgr,     mgr, "PO Admin Review",  "Manager Approved", false);
+poAllow("submitter may cancel their own PO",      emp,     emp, "Submitted",        "Cancelled",       true);
+poAllow("a stranger cannot cancel someone's PO",  mgr,     emp, "Submitted",        "Cancelled",       false);
+poAllow("GM's own PO needs no manager stage",     gm,      direct, "Submitted",     "GM Approved",     true);
 
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail === 0 ? 0 : 1);
