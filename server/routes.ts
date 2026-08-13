@@ -47,15 +47,37 @@ function getAllSubordinateIds(userId: string, allUsers: any[]): string[] {
     }
   }
   const subordinates: string[] = [];
+  // `seen` also guards against reporting cycles (A manages B, B manages A).
+  // Without it this loop never terminates, and because it is synchronous it
+  // blocks the event loop and takes the whole process down, not just one request.
+  const seen = new Set<string>([userId]);
   const queue = [...(childrenMap.get(userId) || [])];
   let i = 0;
   while (i < queue.length) {
     const current = queue[i++];
+    if (seen.has(current)) continue;
+    seen.add(current);
     subordinates.push(current);
     const children = childrenMap.get(current);
     if (children) queue.push(...children);
   }
   return subordinates;
+}
+
+/** Walks up the reporting line from `user`. Cycle-safe: a loop in the manager
+ *  graph would otherwise spin forever, re-querying the same rows. */
+async function buildManagerChain(user: any): Promise<any[]> {
+  const chain: any[] = [];
+  const seen = new Set<string>([user.id]);
+  let current = user;
+  while (current?.managerId && !seen.has(current.managerId)) {
+    seen.add(current.managerId);
+    const mgr = await storage.getUser(current.managerId);
+    if (!mgr) break;
+    chain.push(mgr);
+    current = mgr;
+  }
+  return chain;
 }
 
 async function requireAuth(req: any, res: any, next: any) {
@@ -190,6 +212,19 @@ export async function registerRoutes(
     if (managerId !== null && typeof managerId !== "string") {
       return res.status(400).json({ message: "managerId must be a string or null" });
     }
+    // A cycle in the reporting graph makes the org-chart walks spin forever,
+    // so reject it here rather than letting it get written.
+    if (managerId !== null) {
+      if (managerId === req.params.id) {
+        return res.status(400).json({ message: "A user cannot be their own manager" });
+      }
+      const proposedManager = await storage.getUser(managerId);
+      if (!proposedManager) return res.status(404).json({ message: "Manager not found" });
+      const chain = await buildManagerChain(proposedManager);
+      if (proposedManager.id === req.params.id || chain.some(m => m.id === req.params.id)) {
+        return res.status(400).json({ message: "That change would create a reporting cycle" });
+      }
+    }
     const user = await storage.updateUserManager(req.params.id, managerId);
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(sanitizeUser(user));
@@ -207,13 +242,20 @@ export async function registerRoutes(
 
   app.patch("/api/users/:id/profile", requireSelfOrAdmin, async (req, res) => {
     const { name, email } = req.body;
-    if (!name || typeof name !== "string") return res.status(400).json({ message: "name is required" });
-    if (!email || typeof email !== "string") return res.status(400).json({ message: "email is required" });
-    const nameParts = name.trim().split(/\s+/);
+    if (typeof name !== "string" || typeof email !== "string") {
+      return res.status(400).json({ message: "name and email are required" });
+    }
+    // Trim before the emptiness check: "   " is truthy, and letting it through
+    // blanked the user's name and initials outright.
+    const trimmedName = name.trim();
+    const trimmedEmail = email.trim();
+    if (!trimmedName) return res.status(400).json({ message: "name is required" });
+    if (!trimmedEmail) return res.status(400).json({ message: "email is required" });
+    const nameParts = trimmedName.split(/\s+/);
     const avatarInitials = nameParts.length >= 2
       ? (nameParts[0][0] + nameParts[nameParts.length - 1][0]).toUpperCase()
-      : name.slice(0, 2).toUpperCase();
-    const user = await storage.updateUserProfile(req.params.id, { name: name.trim(), email: email.trim(), avatarInitials });
+      : trimmedName.slice(0, 2).toUpperCase();
+    const user = await storage.updateUserProfile(req.params.id, { name: trimmedName, email: trimmedEmail, avatarInitials });
     if (!user) return res.status(404).json({ message: "User not found" });
     res.json(sanitizeUser(user));
   });
@@ -434,6 +476,12 @@ export async function registerRoutes(
   app.post("/api/expenses", async (req, res) => {
     const parsed = insertExpenseSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+
+    // Without this an unknown id trips the employee_id foreign key, which the
+    // error handler reported as a 500 rather than a bad request.
+    const employee = await storage.getUser(parsed.data.employeeId);
+    if (!employee) return res.status(400).json({ message: "Unknown employeeId" });
+
     const expense = await storage.createExpense(parsed.data);
 
     try {
@@ -629,13 +677,7 @@ export async function registerRoutes(
         try {
           const submitter = await storage.getUser(expense.employeeId);
           if (submitter?.managerId) {
-            const managerChain: any[] = [];
-            let currentUser = submitter;
-            while (currentUser?.managerId) {
-              const mgr = await storage.getUser(currentUser.managerId);
-              if (mgr) managerChain.push(mgr);
-              currentUser = mgr as any;
-            }
+            const managerChain = await buildManagerChain(submitter);
 
             let nextApprover = null;
             if (newStatus === "Manager Approved") {
@@ -796,45 +838,48 @@ export async function registerRoutes(
     const body = { ...req.body, expenseId: req.params.id };
     const parsed = insertCommentSchema.safeParse(body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+
+    // Check the parent first: inserting against a missing expense trips the
+    // foreign key and surfaces the raw constraint name in a 500.
+    const expense = await storage.getExpense(req.params.id);
+    if (!expense) return res.status(404).json({ message: "Expense not found" });
+
     const comment = await storage.createComment(parsed.data);
 
     try {
-      const expense = await storage.getExpense(req.params.id);
-      if (expense) {
-        const commentAuthor = parsed.data.author;
-        const appUser = await getAppUser(req);
-        if (appUser && expense.employeeId !== appUser.id) {
-          await storage.createNotification({
-            userId: expense.employeeId,
-            type: "comment",
-            title: "New Comment on Your Expense",
-            message: `${commentAuthor} commented on "${expense.description}": "${parsed.data.text.substring(0, 100)}${parsed.data.text.length > 100 ? '...' : ''}"`,
-            expenseId: expense.id,
-            isRead: false,
-          });
+      const commentAuthor = parsed.data.author;
+      const appUser = await getAppUser(req);
+      if (appUser && expense.employeeId !== appUser.id) {
+        await storage.createNotification({
+          userId: expense.employeeId,
+          type: "comment",
+          title: "New Comment on Your Expense",
+          message: `${commentAuthor} commented on "${expense.description}": "${parsed.data.text.substring(0, 100)}${parsed.data.text.length > 100 ? '...' : ''}"`,
+          expenseId: expense.id,
+          isRead: false,
+        });
 
-          const submitter = await storage.getUser(expense.employeeId);
-          if (submitter?.notifyEmail && submitter.email) {
-            const emailData = buildCommentEmail({
-              commentAuthor,
-              description: expense.description,
-              amount: expense.amount,
-              commentText: parsed.data.text,
-              expenseId: expense.id,
-            });
-            sendEmail({ to: submitter.email, ...emailData }).catch(e => console.error("[email] Error:", e));
-          }
-          if (submitter?.notifyWebex && submitter?.email) {
-            const webexMsg = buildWebexComment({
-              commentAuthor,
-              description: expense.description,
-              amount: expense.amount,
-              commentText: parsed.data.text,
-              notes: expense.notes,
-              expenseId: expense.id,
-            });
-            sendWebexDirectMessage(submitter.email, webexMsg).catch(e => console.error("[webex] Error:", e));
-          }
+        const submitter = await storage.getUser(expense.employeeId);
+        if (submitter?.notifyEmail && submitter.email) {
+          const emailData = buildCommentEmail({
+            commentAuthor,
+            description: expense.description,
+            amount: expense.amount,
+            commentText: parsed.data.text,
+            expenseId: expense.id,
+          });
+          sendEmail({ to: submitter.email, ...emailData }).catch(e => console.error("[email] Error:", e));
+        }
+        if (submitter?.notifyWebex && submitter?.email) {
+          const webexMsg = buildWebexComment({
+            commentAuthor,
+            description: expense.description,
+            amount: expense.amount,
+            commentText: parsed.data.text,
+            notes: expense.notes,
+            expenseId: expense.id,
+          });
+          sendWebexDirectMessage(submitter.email, webexMsg).catch(e => console.error("[webex] Error:", e));
         }
       }
     } catch (e) {
@@ -1290,7 +1335,23 @@ export async function registerRoutes(
   app.post("/api/purchase-orders", async (req, res) => {
     const parsed = insertPurchaseOrderSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
-    const po = await storage.createPurchaseOrder(parsed.data);
+
+    // The client sends the number it was shown on the form, which may be stale by
+    // the time it submits. Re-derive it here and retry on the unique violation so
+    // two people submitting at once don't collide.
+    let po;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const poNumber = await storage.getNextPoNumber();
+        po = await storage.createPurchaseOrder({ ...parsed.data, poNumber });
+        break;
+      } catch (e: any) {
+        if (e?.code === "23505" && attempt < 5) continue;
+        console.error("Failed to create purchase order:", e);
+        return res.status(e?.code === "23505" ? 409 : 500)
+          .json({ message: "Could not create purchase order. Please try again." });
+      }
+    }
 
     try {
       await storage.createPoHistory({
@@ -1486,13 +1547,7 @@ export async function registerRoutes(
         try {
           const submitter = await storage.getUser(po.submitterId);
           if (submitter?.managerId) {
-            const managerChain: any[] = [];
-            let currentUser = submitter;
-            while (currentUser?.managerId) {
-              const mgr = await storage.getUser(currentUser.managerId);
-              if (mgr) managerChain.push(mgr);
-              currentUser = mgr as any;
-            }
+            const managerChain = await buildManagerChain(submitter);
 
             const nextApprover = managerChain.find(m => m.role === "General Manager");
 
@@ -1615,6 +1670,8 @@ export async function registerRoutes(
   app.post("/api/purchase-orders/:id/comments", async (req, res) => {
     const parsed = insertPoCommentSchema.safeParse({ ...req.body, purchaseOrderId: req.params.id });
     if (!parsed.success) return res.status(400).json({ message: parsed.error.message });
+    const po = await storage.getPurchaseOrder(req.params.id);
+    if (!po) return res.status(404).json({ message: "Purchase order not found" });
     const comment = await storage.createPoComment(parsed.data);
     res.status(201).json(comment);
   });

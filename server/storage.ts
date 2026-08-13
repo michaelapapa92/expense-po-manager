@@ -515,10 +515,14 @@ export class DatabaseStorage implements IStorage {
     return updated;
   }
 
+  // Derived from the highest number actually issued, not from row count: a
+  // deleted PO or a manually-typed number would otherwise make count+1 hand
+  // back a number that already exists, and po_number is UNIQUE.
   async getNextPoNumber(): Promise<string> {
-    const result = await db.select({ count: sql<number>`count(*)` }).from(purchaseOrders);
-    const count = Number(result[0]?.count || 0);
-    const nextNum = count + 1;
+    const result = await db
+      .select({ max: sql<number>`coalesce(max(nullif(regexp_replace(${purchaseOrders.poNumber}, '\\D', '', 'g'), '')::bigint), 0)` })
+      .from(purchaseOrders);
+    const nextNum = Number(result[0]?.max || 0) + 1;
     return `PO-${String(nextNum).padStart(5, '0')}`;
   }
 

@@ -25,6 +25,14 @@ app.use(
 
 app.use(express.urlencoded({ extended: false }));
 
+// Express 5 leaves req.body undefined when no parser matched the request (no
+// body, or a Content-Type the parsers ignore). Handlers destructure it directly,
+// which threw a TypeError and surfaced as a 500 instead of a validation error.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {};
+  next();
+});
+
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
     hour: "numeric",
@@ -73,13 +81,19 @@ app.use((req, res, next) => {
 
   app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
     const status = err.status || err.statusCode || 500;
-    const message = err.message || "Internal Server Error";
 
     console.error("Internal Server Error:", err);
 
     if (res.headersSent) {
       return next(err);
     }
+
+    // Deliberate 4xx carry a message written for the caller. Anything else is
+    // unexpected -- echoing err.message there leaked raw Postgres text such as
+    // table and constraint names to the client.
+    const message = status < 500
+      ? (err.message || "Request failed")
+      : "Internal Server Error";
 
     return res.status(status).json({ message });
   });
