@@ -1,5 +1,5 @@
 import { users, type User } from "@shared/schema";
-import { db } from "../../db";
+import { db } from "../db";
 import { eq } from "drizzle-orm";
 
 export interface IAuthStorage {

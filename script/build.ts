@@ -4,32 +4,24 @@ import { rm, readFile } from "fs/promises";
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
+// Pruned to packages this project actually depends on. The Replit template
+// listed a further 17 (axios, stripe, multer, nodemailer, ...) that were never
+// installed; harmless, since unmatched names are simply never bundled, but
+// misleading about what the server uses.
 const allowlist = [
-  "@google/generative-ai",
-  "axios",
+  "@azure/identity",
+  "@microsoft/microsoft-graph-client",
   "connect-pg-simple",
-  "cors",
-  "date-fns",
   "drizzle-orm",
   "drizzle-zod",
   "express",
-  "express-rate-limit",
   "express-session",
-  "jsonwebtoken",
-  "memorystore",
-  "multer",
+  "memoizee",
   "nanoid",
-  "nodemailer",
-  "openai",
+  "openid-client",
   "passport",
-  "passport-local",
   "pg",
-  "stripe",
-  "uuid",
-  "ws",
-  "xlsx",
   "zod",
-  "zod-validation-error",
 ];
 
 async function buildAll() {

@@ -1,7 +1,7 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { authStorage } from "./replit_integrations/auth";
+import { authStorage } from "./auth";
 import { insertExpenseSchema, insertCommentSchema, insertUserSchema, insertExpenseAttachmentSchema, roleEnum, statusEnum, type ExpenseStatus, poStatusEnum, type POStatus, insertPurchaseOrderSchema, insertPoCommentSchema, insertPoAttachmentSchema } from "@shared/schema";
 import { z } from "zod";
 import { scanReceiptImage } from "./receipt-ocr";

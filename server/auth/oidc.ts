@@ -7,7 +7,7 @@ import type { Express, RequestHandler } from "express";
 import memoize from "memoizee";
 import connectPg from "connect-pg-simple";
 import { authStorage } from "./storage";
-import { getAppUrl } from "../../app-url";
+import { getAppUrl } from "../app-url";
 
 const ONELOGIN_ISSUER_URL = process.env.ONELOGIN_ISSUER_URL!;
 const ONELOGIN_CLIENT_ID = process.env.ONELOGIN_CLIENT_ID!;
